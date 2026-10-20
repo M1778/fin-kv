@@ -7,9 +7,11 @@ in the compiled Fin binary.
 
 ## Build and test
 
-The implementation is verified on Linux with Fin 0.4.0 (contract 3), at both
-`-O0` and `-O2`. It uses POSIX/Linux libc bindings; native Windows and macOS are
-not supported by this server's current socket/file bindings.
+The implementation is verified on Linux x86-64 and ARM64 with Fin 0.4.0
+(contract 3), at both `-O0` and `-O2`, including the full durability/recovery suite
+in [native run 39508662175](https://github.com/M1778/fin-sdk/actions/runs/39508662175).
+It uses POSIX/Linux libc bindings; native Windows and macOS are not supported
+by this server's current socket/file bindings.
 
 ```sh
 finc --fin-libs /path/to/lib/std src/main.fin
