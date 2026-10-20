@@ -1,0 +1,8 @@
+# build outputs
+app
+app.exe
+*.o
+
+# finn (when the package manager lands)
+/target/
+finn.lock

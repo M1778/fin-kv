@@ -1,0 +1,15 @@
+# finn.toml — REAL format per github.com/M1778/finn (README, 2026-10-19).
+# Layout: finn.toml, src/main.fin, tests/, .finn/packages/ (deps install here).
+[project]
+name = "fin-kv"
+version = "0.1.0"
+envpath = ".finn"
+entrypoint = "main.fin"
+
+# No registry is published yet (M1778/finn-registry has no registry_url),
+# and this app is stdlib-only, so [packages] stays empty.
+
+[scripts]
+check = "finc src/main.fin"
+build = "finc src/main.fin -o fin-kv"
+smoke = "python3 tests/smoke.py"

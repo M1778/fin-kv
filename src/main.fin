@@ -1,0 +1,365 @@
+// fin-kv — a Redis-lite key-value server written in Fin.
+//
+// Line protocol over TCP (one command per line, `\n` terminated):
+//   PING                  -> PONG
+//   PING <message>        -> <message>
+//   SET <key> <value>     -> OK            (value may contain spaces)
+//   SET <key> <value> EX <seconds> -> OK   (key expires after <seconds>)
+//   GET <key>             -> <value> | (nil)
+//   DEL <k1> [k2 ...]     -> (integer) <n deleted>
+//   EXISTS <key>          -> (integer) 0 | 1
+//   TTL <key>             -> (integer) <seconds left> | -1 (no expiry) | -2 (no key)
+//   KEYS *                -> (keys) <n> then <n> key lines
+//   QUIT                  -> OK, then the connection closes
+//
+// Errors look like:  (error) <message>
+//
+// Persistence: every SET/DEL is appended to `fin-kv.aof` in the working
+// directory and the log is replayed at startup, so the dataset survives
+// restarts. Entries whose expiry passed are skipped on replay.
+//
+// Design notes (Fin v0.4.0 realities):
+//   - Strings are NUL-terminated C pointers; command names are compared with
+//     `equals` (strcmp), never `==`.
+//   - `blame` aborts the process, so malformed client input NEVER reaches a
+//     `blame` — every bad command gets an `(error)` reply instead. (`parse_int`
+//     blames on garbage, so EX seconds are guarded by `is_numeric` first.)
+//   - `HashMap.__get` blames on a missing key, so every read is guarded by
+//     `exists` (or uses `get_or`).
+//   - The store is two maps (`string->string` values, `string->long` expiry
+//     epochs) rather than one map of structs, to avoid struct-copy ownership
+//     questions in unverified code.
+//   - `recv_bytes` cannot report an exact byte count on EOF, so this file
+//     declares its own `recv` binding (`kv_recv`) and reads `conn.fd`
+//     directly. If `Socket.fd` proves inaccessible, the fallback is
+//     `recv_bytes(1)` (length 1 means EOF there — no ambiguity at cap 1).
+//   - Single-threaded: one client is served at a time until it quits or
+//     disconnects. Concurrency is a future milestone (needs the threading
+//     story from the library builders).
+//   - UNVERIFIED: no working `finc` exists in this environment yet, so this
+//     file has not been through `finc` check / `-o` / run. It is written
+//     strictly against docs/agent-guide.md and the stdlib sources.
+
+import { Socket } from networking::std;
+import { HashMap } from hashmap::std;
+import { Collection } from collection::std;
+import { append_string, read_to_string, file_exists } from fs::std;
+import { now } from time::std;
+import { split, equals, len, concat, parse_int, substr, trim, index_of_char, is_numeric, from_chars, to_chars, to_upper, starts_with } from strings::std;
+
+// Exact-count recv: `networking::std`'s `recv_bytes` cannot distinguish a
+// 0-byte read (peer closed) from a full one, which this server needs to know.
+#[llvm_name="recv"]
+@define kv_recv(fd: int, buf: &char, len: int, flags: int) <int>;
+
+const PORT <int> = 7379;
+const AOF_PATH <string> = "fin-kv.aof";
+const RECV_CAP <int> = 4096;
+
+// A command's answer, plus whether the connection should close afterwards.
+struct Reply { text <string>, close <bool> }
+
+// Result of draining complete lines out of the receive buffer.
+struct Drain { rest <string>, alive <bool> }
+
+fun err(msg: string) <Reply> {
+    return Reply{text: concat("(error) ", concat(msg, "\n")), close: false};
+}
+
+// long -> decimal string (the stdlib has no itoa; parse_int only goes one way).
+fun itoa(n: long) <string> {
+    if (n == cast<long>(0)) { return "0"; }
+    let neg <bool> = n < cast<long>(0);
+    let v <long> = neg : -n ? n;
+    let buf <[char]> = new [char, 24]{};
+    let i <int> = 0;
+    while (v > cast<long>(0)) {
+        let d <int> = cast<int>(v % cast<long>(10));
+        buf[i] = cast<char>(d + cast<int>('0'));
+        v = v / cast<long>(10);
+        i = i + 1;
+    }
+    if (neg) { buf[i] = cast<char>(45); i = i + 1; }
+    let out <[char]> = new [char, i + 1]{};
+    let j <int> = 0;
+    while (j < i) {
+        out[j] = buf[i - 1 - j];
+        j = j + 1;
+    }
+    out[i] = cast<char>(0);
+    let s <string> = from_chars(out, 0, i);
+    delete buf;
+    delete out;
+    return s;
+}
+
+// Decimal string -> long. Callers must guard with `is_numeric` first:
+// unlike `parse_int` this never blames, but garbage in is garbage out.
+fun parse_long(s: string) <long> {
+    let acc <long> = cast<long>(0);
+    let total <int> = len(s);
+    let bytes <[char]> = to_chars(s);
+    for (let i <int> = 0; i < total; i++) {
+        let d <long> = cast<long>(cast<int>(bytes[i]) - cast<int>('0'));
+        acc = acc * cast<long>(10) + d;
+    }
+    delete bytes;
+    return acc;
+}
+
+// True when the key holds an expiry timestamp that has passed.
+fun is_expired(exps: &HashMap<string, long>, key: string) <bool> {
+    let exp <long> = exps.get_or(key, cast<long>(0));
+    return exp != cast<long>(0) && now() >= exp;
+}
+
+// Remove an expired key from both maps. Returns true when something was dropped.
+fun drop_expired(vals: &HashMap<string, string>,
+                 exps: &HashMap<string, long>, key: string) <bool> {
+    if (is_expired(exps, key)) {
+        vals.remove(key);
+        exps.remove(key);
+        aof_log_del(key);
+        return true;
+    }
+    return false;
+}
+
+// --- Append-only log -------------------------------------------------------
+
+fun aof_log_set(key: string, exp_at: long, value: string) <noret> {
+    let line <string> = concat("SET ", concat(key, concat(" ", concat(itoa(exp_at), concat(" ", value)))));
+    if (!append_string(AOF_PATH, concat(line, "\n"))) {
+        printf("warn: could not append to %s\n", AOF_PATH);
+    }
+}
+
+fun aof_log_del(key: string) <noret> {
+    if (!append_string(AOF_PATH, concat(concat("DEL ", key), "\n"))) {
+        printf("warn: could not append to %s\n", AOF_PATH);
+    }
+}
+
+// Replay one AOF line. Returns true when a live key was (re)loaded.
+// Malformed lines are skipped, never blamed: the log is user-influenced input.
+fun replay_line(line: string, vals: &HashMap<string, string>,
+                exps: &HashMap<string, long>) <bool> {
+    let t <string> = trim(line);
+    if (len(t) == 0) { return false; }
+    if (starts_with(t, "SET ")) {
+        let rest <string> = substr(t, 4, len(t) - 4);
+        let sp1 <int> = index_of_char(rest, ' ');
+        if (sp1 < 0) { return false; }
+        let key <string> = substr(rest, 0, sp1);
+        let rest2 <string> = substr(rest, sp1 + 1, len(rest) - sp1 - 1);
+        let sp2 <int> = index_of_char(rest2, ' ');
+        if (sp2 < 0) { return false; }
+        let exp_s <string> = substr(rest2, 0, sp2);
+        if (!is_numeric(exp_s)) { return false; }
+        let exp_at <long> = parse_long(exp_s);
+        let value <string> = substr(rest2, sp2 + 1, len(rest2) - sp2 - 1);
+        if (exp_at != cast<long>(0) && now() >= exp_at) { return false; }
+        vals.__set(key, value);
+        exps.__set(key, exp_at);
+        return true;
+    }
+    if (starts_with(t, "DEL ")) {
+        let key <string> = substr(t, 4, len(t) - 4);
+        vals.remove(key);
+        exps.remove(key);
+        return false;
+    }
+    return false;
+}
+
+fun replay_aof(vals: &HashMap<string, string>, exps: &HashMap<string, long>) <noret> {
+    if (!file_exists(AOF_PATH)) {
+        printf("no %s yet; starting with an empty dataset\n", AOF_PATH);
+        return;
+    }
+    // `read_to_string` is declared `fun?`: it may return null (unreadable file).
+    let content? <string> = read_to_string(AOF_PATH);
+    if (content == null) {
+        printf("warn: could not read %s; starting with an empty dataset\n", AOF_PATH);
+        return;
+    }
+    let text <string> = content?;
+    let loaded <int> = 0;
+    let rest <string> = text;
+    while (true) {
+        let nl <int> = index_of_char(rest, '\n');
+        if (nl < 0) { break; }
+        if (replay_line(substr(rest, 0, nl), vals, exps)) { loaded = loaded + 1; }
+        rest = substr(rest, nl + 1, len(rest) - nl - 1);
+    }
+    printf("replayed %s: %d live key(s) loaded\n", AOF_PATH, loaded);
+}
+
+// --- Command handling ------------------------------------------------------
+
+// Join tokens[from..to] with single spaces (rebuilds values, parses EX).
+fun join_tokens(parts: &Collection<string>, from_idx: int, to: int) <string> {
+    let out <string> = "";
+    let i <int> = from_idx;
+    while (i < to) {
+        if (i > from_idx) { out = concat(out, " "); }
+        out = concat(out, parts[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fun handle_line(line: string, vals: &HashMap<string, string>,
+                exps: &HashMap<string, long>) <Reply> {
+    // Blank line: reply with a bare newline so the one-line-in/one-line-out
+    // framing holds (an empty reply would leave a request/response client
+    // hanging forever).
+    if (len(line) == 0) { return Reply{text: "\n", close: false}; }
+    let parts <&Collection<string>> = split(line, ' ');
+    let argc <int> = parts.len();
+    let cmd <string> = to_upper(parts[0]);
+
+    if (equals(cmd, "PING")) {
+        if (argc == 2) { return Reply{text: concat(parts[1], "\n"), close: false}; }
+        if (argc != 1) { return err("wrong number of arguments for 'ping'"); }
+        return Reply{text: "PONG\n", close: false};
+    }
+    if (equals(cmd, "QUIT")) {
+        return Reply{text: "OK\n", close: true};
+    }
+    if (equals(cmd, "SET")) {
+        if (argc < 3) { return err("wrong number of arguments for 'set'"); }
+        let key <string> = parts[1];
+        // A trailing "EX <seconds>" turns into an expiry timestamp.
+        let val_end <int> = argc;
+        let exp_at <long> = cast<long>(0);
+        if (argc >= 5 && equals(to_upper(parts[argc - 2]), "EX") && is_numeric(parts[argc - 1])) {
+            exp_at = now() + cast<long>(parse_int(parts[argc - 1]));
+            val_end = argc - 2;
+        }
+        let value <string> = join_tokens(parts, 2, val_end);
+        vals.__set(key, value);
+        exps.__set(key, exp_at);
+        aof_log_set(key, exp_at, value);
+        return Reply{text: "OK\n", close: false};
+    }
+    if (equals(cmd, "GET")) {
+        if (argc != 2) { return err("wrong number of arguments for 'get'"); }
+        let key <string> = parts[1];
+        if (!vals.exists(key) || drop_expired(vals, exps, key)) {
+            return Reply{text: "(nil)\n", close: false};
+        }
+        return Reply{text: concat(vals.__get(key), "\n"), close: false};
+    }
+    if (equals(cmd, "DEL")) {
+        if (argc < 2) { return err("wrong number of arguments for 'del'"); }
+        let n <int> = 0;
+        for (let i <int> = 1; i < argc; i++) {
+            drop_expired(vals, exps, parts[i]);
+            if (vals.exists(parts[i])) {
+                vals.remove(parts[i]);
+                exps.remove(parts[i]);
+                aof_log_del(parts[i]);
+                n = n + 1;
+            }
+        }
+        return Reply{text: concat("(integer) ", concat(itoa(cast<long>(n)), "\n")), close: false};
+    }
+    if (equals(cmd, "EXISTS")) {
+        if (argc != 2) { return err("wrong number of arguments for 'exists'"); }
+        let key <string> = parts[1];
+        if (!vals.exists(key) || drop_expired(vals, exps, key)) {
+            return Reply{text: "(integer) 0\n", close: false};
+        }
+        return Reply{text: "(integer) 1\n", close: false};
+    }
+    if (equals(cmd, "TTL")) {
+        if (argc != 2) { return err("wrong number of arguments for 'ttl'"); }
+        let key <string> = parts[1];
+        if (!vals.exists(key) || drop_expired(vals, exps, key)) {
+            return Reply{text: "(integer) -2\n", close: false};
+        }
+        let exp <long> = exps.get_or(key, cast<long>(0));
+        if (exp == cast<long>(0)) {
+            return Reply{text: "(integer) -1\n", close: false};
+        }
+        let left <long> = exp - now();
+        if (left < cast<long>(0)) { left = cast<long>(0); }
+        return Reply{text: concat("(integer) ", concat(itoa(left), "\n")), close: false};
+    }
+    if (equals(cmd, "KEYS")) {
+        if (argc != 2 || !equals(parts[1], "*")) {
+            return err("only KEYS * is supported");
+        }
+        let count <int> = 0;
+        let body <string> = "";
+        let slots <int> = vals.slot_count();
+        for (let s <int> = 0; s < slots; s++) {
+            if (vals.is_live(s)) {
+                let key <string> = vals.key_at(s);
+                if (!drop_expired(vals, exps, key)) {
+                    body = concat(body, concat(key, "\n"));
+                    count = count + 1;
+                }
+            }
+        }
+        let head <string> = concat("(keys) ", concat(itoa(cast<long>(count)), "\n"));
+        return Reply{text: concat(head, body), close: false};
+    }
+    return err(concat("unknown command '", concat(parts[0], "'")));
+}
+
+// Pull complete `\n`-terminated lines out of `data`, answer each, and hand
+// back the unterminated remainder plus whether the client is still alive.
+fun drain_lines(data: string, conn: &Socket, vals: &HashMap<string, string>,
+                exps: &HashMap<string, long>) <Drain> {
+    let rest <string> = data;
+    while (true) {
+        let nl <int> = index_of_char(rest, '\n');
+        if (nl < 0) { return Drain{rest: rest, alive: true}; }
+        let line <string> = trim(substr(rest, 0, nl));
+        rest = substr(rest, nl + 1, len(rest) - nl - 1);
+        let r <Reply> = handle_line(line, vals, exps);
+        if (len(r.text) > 0) {
+            if (!conn.send_text(r.text, len(r.text))) {
+                return Drain{rest: "", alive: false};
+            }
+        }
+        if (r.close) { return Drain{rest: "", alive: false}; }
+    }
+    // Unreachable: silences the frontend, which does not treat while(true) as diverging.
+    return Drain{rest: "", alive: false};
+}
+
+// Serve one client until it quits, disconnects, or a send fails.
+fun serve_client(conn: &Socket, vals: &HashMap<string, string>,
+                 exps: &HashMap<string, long>) <noret> {
+    let buf <[char]> = new [char, RECV_CAP + 1]{};
+    let rem <string> = "";
+    let alive <bool> = true;
+    while (alive) {
+        let n <int> = kv_recv(conn.fd, &buf[0], RECV_CAP, 0);
+        if (n <= 0) { break; }
+        buf[n] = cast<char>(0);
+        let piece <string> = from_chars(buf, 0, n);
+        let d <Drain> = drain_lines(concat(rem, piece), conn, vals, exps);
+        rem = d.rest;
+        alive = d.alive;
+    }
+    delete buf;
+}
+
+fun main() <int> {
+    let vals <HashMap<string, string>> = HashMap::<string, string>();
+    let exps <HashMap<string, long>> = HashMap::<string, long>();
+    replay_aof(&vals, &exps);
+    let srv <Socket> = Socket::serve(PORT, 16);
+    printf("fin-kv v0.1.0 listening on 127.0.0.1:%d (aof: %s)\n", PORT, AOF_PATH);
+    printf("talk to it with:  nc 127.0.0.1 %d\n", PORT);
+    while (true) {
+        let conn <Socket> = srv.accept_conn();
+        serve_client(&conn, &vals, &exps);
+        conn.shutdown();
+    }
+    return 0;
+}
