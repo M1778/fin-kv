@@ -437,6 +437,38 @@ def large_replay(binary, root):
         expect(c.cmd("SET replacement v"), "OK")
 
 
+def architecture_mapping(compiler, libraries, opt, work):
+    # Compile the actual production pure helper, not a Python copy of its table.
+    # This checks both mappings on either host without forcing wrong syscall bits.
+    source = (ROOT / "src/main.fin").read_text()
+    assert source.count("fun main() <int>") == 1
+    helper_test = source.replace("fun main() <int>", "fun server_main() <int>", 1)
+    helper_test += r'''
+fun main() <int> {
+    let x86 <OpenFlags> = linux_open_flags("x86_64");
+    blame x86.valid && x86.aof == 658498 && x86.directory == 589824;
+    let arm <OpenFlags> = linux_open_flags("aarch64");
+    blame arm.valid && arm.aof == 560194 && arm.directory == 540672;
+    let unsupported <OpenFlags> = linux_open_flags("riscv64");
+    blame !unsupported.valid && unsupported.aof == 0 && unsupported.directory == 0;
+    let empty <OpenFlags> = linux_open_flags("");
+    blame !empty.valid;
+    let actual <OpenFlags> = detect_open_flags();
+    blame actual.valid;
+    printf("ARCHITECTURE MAPPING OK\n");
+    return 0;
+}
+'''
+    test_source = work / "architecture.fin"
+    test_binary = work / "architecture"
+    test_source.write_text(helper_test)
+    command = [compiler, str(test_source), "-o", str(test_binary), "-" + opt]
+    if libraries:
+        command += ["--fin-libs", libraries]
+    subprocess.run(command, check=True, timeout=120)
+    subprocess.run([str(test_binary)], check=True, timeout=5)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler", default=os.environ.get("FINC", "finc"))
@@ -453,6 +485,7 @@ def main():
             if args.fin_libs:
                 command += ["--fin-libs", args.fin_libs]
             subprocess.run(command, check=True, timeout=120)
+            architecture_mapping(args.compiler, args.fin_libs, args.opt, work)
         shim_source = work / "faults.c"
         shim = work / "faults.so"
         shim_source.write_text(FAULT_SHIM)

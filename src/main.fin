@@ -5,6 +5,8 @@ import { len, equals, concat, substr, from_chars, to_chars, to_upper, clone, fre
 import { now } from time::std;
 import { hash_of } from hashmap::std;
 
+#[llvm_name="uname"]
+@define kv_uname(buf: &char) <int>;
 #[llvm_name="open"]
 @define kv_open(path: string, flags: int, mode: int) <int>;
 #[llvm_name="close"]
@@ -71,6 +73,49 @@ struct Number { valid <bool>, value <long> }
 // op: 1 PING, 2 SET, 3 GET, 4 DEL, 5 EXISTS, 6 TTL, 7 KEYS, 8 QUIT.
 struct Parsed { op <int>, key <string>, value <string>, exp <long>, keys <[string]>, count <int>, error <string> }
 struct Reply { text <string>, close <bool> }
+struct OpenFlags { valid <bool>, aof <int>, directory <int> }
+
+// Linux UAPI: ARM64 overrides asm-generic/fcntl.h's directory/nofollow bits.
+// No O_DIRECT is requested: the x86 O_DIRECTORY bit means O_DIRECT on ARM64.
+fun linux_open_flags(machine: string) <OpenFlags> {
+    // O_RDWR|O_CREAT|O_APPEND|O_NONBLOCK|O_CLOEXEC is shared by these ABIs.
+    const COMMON <int> = 527426;
+    if (equals(machine, "x86_64")) {
+        return OpenFlags{valid: true, aof: COMMON + 131072, directory: 524288 + 65536};
+    }
+    if (equals(machine, "aarch64")) {
+        return OpenFlags{valid: true, aof: COMMON + 32768, directory: 524288 + 16384};
+    }
+    return OpenFlags{valid: false, aof: 0, directory: 0};
+}
+fun detect_open_flags() <OpenFlags> {
+    let invalid <OpenFlags> = OpenFlags{valid: false, aof: 0, directory: 0};
+    // Linux struct new_utsname is six 65-byte char fields (390 bytes):
+    // sysname at 0; machine at 4*65=260. Validate both terminators before use.
+    let info <[char]> = new [char, 390]{};
+    if (kv_uname(&info[0]) != 0) {
+        printf("error: uname failed (errno=%d)\n", *kv_errno());
+        delete info; kv_fflush(null); return invalid;
+    }
+    let system_end <int> = 0;
+    while (system_end < 65 && info[system_end] != cast<char>(0)) { system_end++; }
+    let machine_end <int> = 260;
+    while (machine_end < 325 && info[machine_end] != cast<char>(0)) { machine_end++; }
+    if (system_end == 65 || machine_end == 325) {
+        printf("error: invalid uname field layout\n");
+        delete info; kv_fflush(null); return invalid;
+    }
+    let system <string> = from_chars(info, 0, system_end);
+    let machine <string> = from_chars(info, 260, machine_end - 260);
+    let flags <OpenFlags> = linux_open_flags(machine);
+    if (!equals(system, "Linux") || !flags.valid) {
+        printf("error: unsupported platform %s/%s; require Linux x86_64 or aarch64\n", system, machine);
+        flags = invalid;
+        kv_fflush(null);
+    }
+    free_str(system); free_str(machine); delete info;
+    return flags;
+}
 
 fun decimal(s: string, maximum: long) <Number> {
     let chars <[char]> = to_chars(s);
@@ -378,8 +423,10 @@ fun replay_aof(log: &Log, store: &Store) <bool> {
     return valid;
 }
 fun open_log(log: &Log, store: &Store) <bool> {
+    let flags <OpenFlags> = detect_open_flags();
+    if (!flags.valid) { return false; }
     // Linux O_RDWR|O_CREAT|O_APPEND|O_NONBLOCK|O_NOFOLLOW|O_CLOEXEC; mode 0600.
-    log.fd = kv_open(AOF_PATH, 658498, 384);
+    log.fd = kv_open(AOF_PATH, flags.aof, 384);
     if (log.fd < 0) { printf("error: cannot open AOF for read/write\n"); return false; }
     if (kv_flock(log.fd, 6) != 0) { printf("error: AOF already locked\n"); return false; }
     if (kv_seek(log.fd, cast<long>(0), 2) < cast<long>(0) || kv_seek(log.fd, cast<long>(0), 0) != cast<long>(0)) {
@@ -394,11 +441,23 @@ fun open_log(log: &Log, store: &Store) <bool> {
     // Unbuffered writes avoid retained stdio bytes escaping after rollback.
     if (kv_setvbuf(log.fp, null, 2, cast<ulong>(0)) != 0) { return false; }
     // Make creation of the fixed path durable before accepting any requests.
-    let dir <int> = kv_open(".", 589824, 0);
-    if (dir < 0) { return false; }
-    let synced <bool> = kv_fsync(log.fd) == 0 && kv_fsync(dir) == 0;
-    let closed <int> = kv_close(dir);
-    if (!synced || closed != 0) { return false; }
+    let dir <int> = kv_open(".", flags.directory, 0);
+    if (dir < 0) {
+        printf("error: cannot open AOF parent directory (flags=%d, errno=%d)\n", flags.directory, *kv_errno());
+        kv_fflush(null); return false;
+    }
+    if (kv_fsync(log.fd) != 0) {
+        printf("error: initial AOF fsync failed (errno=%d)\n", *kv_errno());
+        kv_close(dir); kv_fflush(null); return false;
+    }
+    if (kv_fsync(dir) != 0) {
+        printf("error: AOF parent directory fsync failed (errno=%d)\n", *kv_errno());
+        kv_close(dir); kv_fflush(null); return false;
+    }
+    if (kv_close(dir) != 0) {
+        printf("error: AOF parent directory close failed (errno=%d)\n", *kv_errno());
+        kv_fflush(null); return false;
+    }
     printf("replayed %s: %d live key(s) loaded\n", AOF_PATH, store.count);
     return true;
 }
