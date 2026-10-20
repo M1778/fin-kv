@@ -1,365 +1,618 @@
-// fin-kv — a Redis-lite key-value server written in Fin.
-//
-// Line protocol over TCP (one command per line, `\n` terminated):
-//   PING                  -> PONG
-//   PING <message>        -> <message>
-//   SET <key> <value>     -> OK            (value may contain spaces)
-//   SET <key> <value> EX <seconds> -> OK   (key expires after <seconds>)
-//   GET <key>             -> <value> | (nil)
-//   DEL <k1> [k2 ...]     -> (integer) <n deleted>
-//   EXISTS <key>          -> (integer) 0 | 1
-//   TTL <key>             -> (integer) <seconds left> | -1 (no expiry) | -2 (no key)
-//   KEYS *                -> (keys) <n> then <n> key lines
-//   QUIT                  -> OK, then the connection closes
-//
-// Errors look like:  (error) <message>
-//
-// Persistence: every SET/DEL is appended to `fin-kv.aof` in the working
-// directory and the log is replayed at startup, so the dataset survives
-// restarts. Entries whose expiry passed are skipped on replay.
-//
-// Design notes (Fin v0.4.0 realities):
-//   - Strings are NUL-terminated C pointers; command names are compared with
-//     `equals` (strcmp), never `==`.
-//   - `blame` aborts the process, so malformed client input NEVER reaches a
-//     `blame` — every bad command gets an `(error)` reply instead. (`parse_int`
-//     blames on garbage, so EX seconds are guarded by `is_numeric` first.)
-//   - `HashMap.__get` blames on a missing key, so every read is guarded by
-//     `exists` (or uses `get_or`).
-//   - The store is two maps (`string->string` values, `string->long` expiry
-//     epochs) rather than one map of structs, to avoid struct-copy ownership
-//     questions in unverified code.
-//   - `recv_bytes` cannot report an exact byte count on EOF, so this file
-//     declares its own `recv` binding (`kv_recv`) and reads `conn.fd`
-//     directly. If `Socket.fd` proves inaccessible, the fallback is
-//     `recv_bytes(1)` (length 1 means EOF there — no ambiguity at cap 1).
-//   - Single-threaded: one client is served at a time until it quits or
-//     disconnects. Concurrency is a future milestone (needs the threading
-//     story from the library builders).
-//   - UNVERIFIED: no working `finc` exists in this environment yet, so this
-//     file has not been through `finc` check / `-o` / run. It is written
-//     strictly against docs/agent-guide.md and the stdlib sources.
-
-import { Socket } from networking::std;
-import { HashMap } from hashmap::std;
-import { Collection } from collection::std;
-import { append_string, read_to_string, file_exists } from fs::std;
+// fin-kv: single-process, bounded, loopback TCP store (Linux/POSIX).
+// Strings in Store are owned; Parsed and Reply own their strings (error is borrowed).
+// AOF records are committed before map mutation. See README for failure semantics.
+import { len, equals, concat, substr, from_chars, to_chars, to_upper, clone, free_str, starts_with } from strings::std;
 import { now } from time::std;
-import { split, equals, len, concat, parse_int, substr, trim, index_of_char, is_numeric, from_chars, to_chars, to_upper, starts_with } from strings::std;
+import { hash_of } from hashmap::std;
 
-// Exact-count recv: `networking::std`'s `recv_bytes` cannot distinguish a
-// 0-byte read (peer closed) from a full one, which this server needs to know.
+#[llvm_name="open"]
+@define kv_open(path: string, flags: int, mode: int) <int>;
+#[llvm_name="close"]
+@define kv_close(fd: int) <int>;
+#[llvm_name="fdopen"]
+@define kv_fdopen(fd: int, mode: string) <&void>;
+#[llvm_name="setvbuf"]
+@define kv_setvbuf(fp: &void, buf: &char, mode: int, size: ulong) <int>;
+#[llvm_name="fwrite"]
+@define kv_fwrite(buf: string, size: ulong, count: ulong, fp: &void) <ulong>;
+#[llvm_name="fflush"]
+@define kv_fflush(fp: &void) <int>;
+#[llvm_name="fclose"]
+@define kv_fclose(fp: &void) <int>;
+#[llvm_name="fsync"]
+@define kv_fsync(fd: int) <int>;
+#[llvm_name="ftruncate"]
+@define kv_truncate(fd: int, size: long) <int>;
+#[llvm_name="flock"]
+@define kv_flock(fd: int, operation: int) <int>;
+#[llvm_name="lseek"]
+@define kv_seek(fd: int, offset: long, whence: int) <long>;
+#[llvm_name="read"]
+@define kv_read(fd: int, buf: &char, count: ulong) <long>;
+#[llvm_name="__errno_location"]
+@define kv_errno() <&int>;
+#[llvm_name="getenv"]
+@define kv_getenv(name: string) <string>;
+#[llvm_name="clock_gettime"]
+@define kv_clock(id: int, ts: &long) <int>;
+#[llvm_name="socket"]
+@define kv_socket(domain: int, kind: int, protocol: int) <int>;
+#[llvm_name="setsockopt"]
+@define kv_setsockopt(fd: int, level: int, option: int, value: &int, size: int) <int>;
+#[llvm_name="inet_addr"]
+@define kv_inet_addr(host: string) <int>;
+#[llvm_name="bind"]
+@define kv_bind(fd: int, addr: &int, size: int) <int>;
+#[llvm_name="listen"]
+@define kv_listen(fd: int, backlog: int) <int>;
+#[llvm_name="getsockname"]
+@define kv_sockname(fd: int, addr: &int, size: &int) <int>;
+#[llvm_name="accept"]
+@define kv_accept(fd: int, addr: &int, size: &int) <int>;
+#[llvm_name="poll"]
+@define kv_poll(fds: &int, count: ulong, timeout: int) <int>;
 #[llvm_name="recv"]
-@define kv_recv(fd: int, buf: &char, len: int, flags: int) <int>;
+@define kv_recv(fd: int, buf: &char, count: ulong, flags: int) <long>;
+#[llvm_name="send"]
+@define kv_send(fd: int, buf: &char, count: ulong, flags: int) <long>;
 
-const PORT <int> = 7379;
 const AOF_PATH <string> = "fin-kv.aof";
-const RECV_CAP <int> = 4096;
+const MAX_FRAME <int> = 8192;
+const MAX_KEY <int> = 256;
+const MAX_VALUE <int> = 4096;
+const MAX_DEL <int> = 128;
+const SLOTS <int> = 16384;
+const MAX_KEYS <int> = 8192;
+const MAX_BYTES <int> = 33554432;
 
-// A command's answer, plus whether the connection should close afterwards.
+struct Store { keys <[string]>, values <[string]>, expires <[long]>, states <[int]>, count <int>, bytes <int> }
+struct Log { fd <int>, fp <&void>, end <long>, failed <bool> }
+struct Number { valid <bool>, value <long> }
+// op: 1 PING, 2 SET, 3 GET, 4 DEL, 5 EXISTS, 6 TTL, 7 KEYS, 8 QUIT.
+struct Parsed { op <int>, key <string>, value <string>, exp <long>, keys <[string]>, count <int>, error <string> }
 struct Reply { text <string>, close <bool> }
 
-// Result of draining complete lines out of the receive buffer.
-struct Drain { rest <string>, alive <bool> }
-
-fun err(msg: string) <Reply> {
-    return Reply{text: concat("(error) ", concat(msg, "\n")), close: false};
+fun decimal(s: string, maximum: long) <Number> {
+    let chars <[char]> = to_chars(s);
+    let n <int> = chars.length - 1;
+    let value <long> = cast<long>(0);
+    let valid <bool> = n > 0;
+    for (let i <int> = 0; i < n && valid; i++) {
+        let digit <int> = cast<int>(chars[i]) - cast<int>('0');
+        if (digit < 0 || digit > 9) { valid = false; }
+        else if (value > (maximum - cast<long>(digit)) / cast<long>(10)) { valid = false; }
+        else { value = value * cast<long>(10) + cast<long>(digit); }
+    }
+    delete chars;
+    return Number{valid: valid, value: value};
 }
 
-// long -> decimal string (the stdlib has no itoa; parse_int only goes one way).
 fun itoa(n: long) <string> {
-    if (n == cast<long>(0)) { return "0"; }
-    let neg <bool> = n < cast<long>(0);
-    let v <long> = neg : -n ? n;
     let buf <[char]> = new [char, 24]{};
-    let i <int> = 0;
-    while (v > cast<long>(0)) {
-        let d <int> = cast<int>(v % cast<long>(10));
-        buf[i] = cast<char>(d + cast<int>('0'));
+    let v <long> = n;
+    if (v < cast<long>(0)) { v = -v; }
+    let i <int> = 23;
+    while (true) {
+        i--;
+        buf[i] = cast<char>(cast<int>(v % cast<long>(10)) + cast<int>('0'));
         v = v / cast<long>(10);
-        i = i + 1;
+        if (v == cast<long>(0)) { break; }
     }
-    if (neg) { buf[i] = cast<char>(45); i = i + 1; }
-    let out <[char]> = new [char, i + 1]{};
-    let j <int> = 0;
-    while (j < i) {
-        out[j] = buf[i - 1 - j];
-        j = j + 1;
-    }
-    out[i] = cast<char>(0);
-    let s <string> = from_chars(out, 0, i);
+    if (n < cast<long>(0)) { i--; buf[i] = '-'; }
+    let result <string> = from_chars(buf, i, 23 - i);
     delete buf;
-    delete out;
-    return s;
+    return result;
 }
 
-// Decimal string -> long. Callers must guard with `is_numeric` first:
-// unlike `parse_int` this never blames, but garbage in is garbage out.
-fun parse_long(s: string) <long> {
-    let acc <long> = cast<long>(0);
-    let total <int> = len(s);
-    let bytes <[char]> = to_chars(s);
-    for (let i <int> = 0; i < total; i++) {
-        let d <long> = cast<long>(cast<int>(bytes[i]) - cast<int>('0'));
-        acc = acc * cast<long>(10) + d;
+fun reply(text: string) <Reply> { return Reply{text: concat(text, "\n"), close: false}; }
+fun error_reply(text: string) <Reply> {
+    let msg <string> = concat("(error) ", text);
+    let result <Reply> = reply(msg);
+    free_str(msg);
+    return result;
+}
+fun integer_reply(value: long) <Reply> {
+    let number <string> = itoa(value);
+    let msg <string> = concat("(integer) ", number);
+    let result <Reply> = reply(msg);
+    free_str(number); free_str(msg);
+    return result;
+}
+
+fun make_store() <Store> {
+    return Store{keys: new [string, SLOTS]{}, values: new [string, SLOTS]{}, expires: new [long, SLOTS]{}, states: new [int, SLOTS]{}, count: 0, bytes: 0};
+}
+// Probe over owned arrays. Tombstone slots are reused without retaining strings.
+fun find_slot(store: &Store, key: string) <int> {
+    let start <int> = hash_of::<string>(key) % SLOTS;
+    let vacant <int> = -1;
+    for (let i <int> = 0; i < SLOTS; i++) {
+        let at <int> = (start + i) % SLOTS;
+        if (store.states[at] == 0) { return vacant >= 0 : vacant ? at; }
+        if (store.states[at] == 2 && vacant < 0) { vacant = at; }
+        if (store.states[at] == 1 && equals(store.keys[at], key)) { return at; }
+    }
+    return vacant;
+}
+fun erase_slot(store: &Store, at: int) <noret> {
+    if (at < 0 || store.states[at] != 1) { return; }
+    store.bytes -= len(store.keys[at]) + len(store.values[at]);
+    free_str(store.keys[at]); free_str(store.values[at]);
+    store.keys[at] = ""; store.values[at] = ""; store.expires[at] = cast<long>(0);
+    store.states[at] = 2; store.count--;
+}
+fun expired(store: &Store, at: int) <bool> {
+    return at >= 0 && store.states[at] == 1 && store.expires[at] != cast<long>(0) && now() >= store.expires[at];
+}
+fun lookup(store: &Store, key: string) <int> {
+    let at <int> = find_slot(store, key);
+    if (expired(store, at)) { erase_slot(store, at); }
+    if (at < 0 || store.states[at] != 1) { return -1; }
+    return at;
+}
+fun can_put(store: &Store, key: string, value: string) <bool> {
+    let at <int> = find_slot(store, key);
+    if (at < 0) { return false; }
+    let size <int> = store.bytes + len(key) + len(value);
+    if (store.states[at] == 1) { size -= len(store.keys[at]) + len(store.values[at]); }
+    else if (store.count >= MAX_KEYS) { return false; }
+    return size <= MAX_BYTES;
+}
+fun put(store: &Store, key: string, value: string, exp: long) <noret> {
+    let at <int> = find_slot(store, key);
+    // Allocate independent ownership before releasing an old value.
+    let owned_key <string> = clone(key);
+    let owned_value <string> = clone(value);
+    erase_slot(store, at);
+    store.keys[at] = owned_key; store.values[at] = owned_value;
+    store.expires[at] = exp; store.states[at] = 1;
+    store.count++; store.bytes += len(key) + len(value);
+}
+fun free_store(store: &Store) <noret> {
+    for (let i <int> = 0; i < SLOTS; i++) { erase_slot(store, i); }
+    delete store.keys; delete store.values; delete store.expires; delete store.states;
+}
+fun sweep(store: &Store) <noret> {
+    for (let i <int> = 0; i < SLOTS; i++) { if (expired(store, i)) { erase_slot(store, i); } }
+}
+
+fun space_at(bytes: [char], start: int, n: int) <int> {
+    let i <int> = start;
+    while (i < n && bytes[i] != ' ') { i++; }
+    return i;
+}
+fun valid_key(key: string) <bool> {
+    let bytes <[char]> = to_chars(key);
+    let n <int> = bytes.length - 1;
+    let valid <bool> = n > 0 && n <= MAX_KEY;
+    for (let i <int> = 0; i < n; i++) {
+        let c <int> = cast<int>(bytes[i]) & 255;
+        if (c <= 32 || c == 127) { valid = false; }
     }
     delete bytes;
-    return acc;
+    return valid;
 }
-
-// True when the key holds an expiry timestamp that has passed.
-fun is_expired(exps: &HashMap<string, long>, key: string) <bool> {
-    let exp <long> = exps.get_or(key, cast<long>(0));
-    return exp != cast<long>(0) && now() >= exp;
+fun free_parsed(p: &Parsed) <noret> {
+    free_str(p.key);
+    free_str(p.value);
+    for (let i <int> = 0; i < p.count; i++) { free_str(p.keys[i]); }
+    delete p.keys;
 }
-
-// Remove an expired key from both maps. Returns true when something was dropped.
-fun drop_expired(vals: &HashMap<string, string>,
-                 exps: &HashMap<string, long>, key: string) <bool> {
-    if (is_expired(exps, key)) {
-        vals.remove(key);
-        exps.remove(key);
-        aof_log_del(key);
-        return true;
+fun parse_set(line: string, bytes: [char], start: int, n: int, replay: bool, p: &Parsed) <noret> {
+    let end <int> = space_at(bytes, start, n);
+    free_str(p.key);
+    p.key = substr(line, start, end - start);
+    if (!valid_key(p.key) || end == n) { p.error = "invalid SET key or missing value"; return; }
+    let value_start <int> = end + 1;
+    let value_end <int> = n;
+    if (replay) {
+        let exp_end <int> = space_at(bytes, value_start, n);
+        let text <string> = substr(line, value_start, exp_end - value_start);
+        let number <Number> = decimal(text, cast<long>(9223372036854775807));
+        free_str(text);
+        if (!number.valid || exp_end - value_start > 19 || exp_end == n) { p.error = "invalid AOF expiry"; return; }
+        p.exp = number.value;
+        value_start = exp_end + 1;
+    } else {
+        let last <int> = n - 1;
+        while (last >= value_start && bytes[last] != ' ') { last--; }
+        let before <int> = last - 1;
+        while (before >= value_start && bytes[before] != ' ') { before--; }
+        if (last > value_start && before >= value_start) {
+            let word <string> = substr(line, before + 1, last - before - 1);
+            let upper <string> = to_upper(word);
+            let is_ex <bool> = equals(upper, "EX");
+            free_str(word); free_str(upper);
+            if (is_ex) {
+                let seconds <string> = substr(line, last + 1, n - last - 1);
+                let number <Number> = decimal(seconds, cast<long>(2147483647));
+                free_str(seconds);
+                let epoch <long> = now();
+                if (!number.valid || number.value == cast<long>(0) || epoch < cast<long>(0) || epoch > cast<long>(9223372036854775807) - number.value) {
+                    p.error = "EX must be between 1 and 2147483647 seconds"; return;
+                }
+                p.exp = epoch + number.value; value_end = before;
+            }
+        }
+        let tail <string> = substr(line, last + 1, n - last - 1);
+        let upper_tail <string> = to_upper(tail);
+        if (equals(upper_tail, "EX") && last >= value_start) { p.error = "missing EX seconds"; }
+        free_str(tail); free_str(upper_tail);
     }
-    return false;
+    if (value_end <= value_start || value_end - value_start > MAX_VALUE) { p.error = "invalid value length"; return; }
+    free_str(p.value);
+    p.value = substr(line, value_start, value_end - value_start);
+}
+fun parse_line(line: string, replay: bool) <Parsed> {
+    let p <Parsed> = Parsed{op: 0, key: clone(""), value: clone(""), exp: cast<long>(0), keys: new [string, MAX_DEL]{}, count: 0, error: ""};
+    let bytes <[char]> = to_chars(line);
+    let n <int> = bytes.length - 1;
+    let end <int> = space_at(bytes, 0, n);
+    let word <string> = substr(line, 0, end);
+    let command <string> = replay : clone(word) ? to_upper(word);
+    free_str(word);
+    if (equals(command, "SET")) { p.op = 2; }
+    else if (equals(command, "DEL")) { p.op = 4; }
+    else if (!replay) {
+        if (equals(command, "PING")) { p.op = 1; }
+        if (equals(command, "GET")) { p.op = 3; }
+        if (equals(command, "EXISTS")) { p.op = 5; }
+        if (equals(command, "TTL")) { p.op = 6; }
+        if (equals(command, "KEYS")) { p.op = 7; }
+        if (equals(command, "QUIT")) { p.op = 8; }
+    }
+    free_str(command);
+    if (p.op == 0) { p.error = "unknown command"; }
+    else if (p.op == 1) {
+        free_str(p.value);
+        p.value = end == n : clone("PONG") ? substr(line, end + 1, n - end - 1);
+    } else if (p.op == 8) {
+        if (end != n) { p.error = "wrong number of arguments for 'quit'"; }
+    } else if (end == n) { p.error = "missing arguments"; }
+    else if (p.op == 2) { parse_set(line, bytes, end + 1, n, replay, &p); }
+    else if (p.op == 4) {
+        let start <int> = end + 1;
+        while (start <= n && len(p.error) == 0) {
+            let stop <int> = space_at(bytes, start, n);
+            let key <string> = substr(line, start, stop - start);
+            if (!valid_key(key) || p.count == MAX_DEL) { free_str(key); p.error = "invalid DEL keys"; }
+            else { p.keys[p.count] = key; p.count++; }
+            start = stop + 1;
+        }
+    } else {
+        free_str(p.key);
+        p.key = substr(line, end + 1, n - end - 1);
+        if (!valid_key(p.key)) { p.error = "invalid key or argument count"; }
+        if (p.op == 7 && !equals(p.key, "*")) { p.error = "only KEYS * is supported"; }
+    }
+    delete bytes;
+    return p;
 }
 
-// --- Append-only log -------------------------------------------------------
-
-fun aof_log_set(key: string, exp_at: long, value: string) <noret> {
-    let line <string> = concat("SET ", concat(key, concat(" ", concat(itoa(exp_at), concat(" ", value)))));
-    if (!append_string(AOF_PATH, concat(line, "\n"))) {
-        printf("warn: could not append to %s\n", AOF_PATH);
+// A tail may be discarded ONLY if it is a prefix of a valid record. Complete
+// newline-terminated corruption is never repaired, and no repair happens early.
+fun torn_prefix(line: string) <bool> {
+    let n <int> = len(line);
+    if (equals(line, "S") || equals(line, "SE") || equals(line, "SET") || equals(line, "D") || equals(line, "DE") || equals(line, "DEL")) { return true; }
+    let is_set <bool> = starts_with(line, "SET ");
+    if (!is_set && !starts_with(line, "DEL ")) { return false; }
+    let bytes <[char]> = to_chars(line);
+    let start <int> = 4;
+    let valid <bool> = true;
+    let count <int> = 0;
+    while (start < n && valid) {
+        let end <int> = space_at(bytes, start, n);
+        let key <string> = substr(line, start, end - start);
+        valid = valid_key(key);
+        free_str(key);
+        count++;
+        if (count > MAX_DEL) { valid = false; }
+        if (!valid || end == n) { break; }
+        start = end + 1;
+        if (is_set) {
+            if (start == n) { break; }
+            let stop <int> = space_at(bytes, start, n);
+            let exp <string> = substr(line, start, stop - start);
+            let number <Number> = decimal(exp, cast<long>(9223372036854775807));
+            free_str(exp);
+            valid = number.valid && stop - start <= 19;
+            if (stop < n && n - stop - 1 > MAX_VALUE) { valid = false; }
+            break;
+        }
     }
+    // After 128 DEL keys, an extra separator cannot begin a valid record.
+    if (!is_set && count == MAX_DEL && n > 4 && bytes[n - 1] == ' ') { valid = false; }
+    delete bytes;
+    return valid;
 }
-
-fun aof_log_del(key: string) <noret> {
-    if (!append_string(AOF_PATH, concat(concat("DEL ", key), "\n"))) {
-        printf("warn: could not append to %s\n", AOF_PATH);
+fun replay_line(line: string, store: &Store) <bool> {
+    let p <Parsed> = parse_line(line, true);
+    let valid <bool> = len(p.error) == 0;
+    if (valid && p.op == 2) {
+        if (p.exp != cast<long>(0) && now() >= p.exp) { erase_slot(store, find_slot(store, p.key)); }
+        else if (!can_put(store, p.key, p.value)) { valid = false; }
+        else { put(store, p.key, p.value, p.exp); }
     }
+    if (valid && p.op == 4) {
+        for (let i <int> = 0; i < p.count; i++) { erase_slot(store, find_slot(store, p.keys[i])); }
+    }
+    free_parsed(&p);
+    return valid;
 }
-
-// Replay one AOF line. Returns true when a live key was (re)loaded.
-// Malformed lines are skipped, never blamed: the log is user-influenced input.
-fun replay_line(line: string, vals: &HashMap<string, string>,
-                exps: &HashMap<string, long>) <bool> {
-    let t <string> = trim(line);
-    if (len(t) == 0) { return false; }
-    if (starts_with(t, "SET ")) {
-        let rest <string> = substr(t, 4, len(t) - 4);
-        let sp1 <int> = index_of_char(rest, ' ');
-        if (sp1 < 0) { return false; }
-        let key <string> = substr(rest, 0, sp1);
-        let rest2 <string> = substr(rest, sp1 + 1, len(rest) - sp1 - 1);
-        let sp2 <int> = index_of_char(rest2, ' ');
-        if (sp2 < 0) { return false; }
-        let exp_s <string> = substr(rest2, 0, sp2);
-        if (!is_numeric(exp_s)) { return false; }
-        let exp_at <long> = parse_long(exp_s);
-        let value <string> = substr(rest2, sp2 + 1, len(rest2) - sp2 - 1);
-        if (exp_at != cast<long>(0) && now() >= exp_at) { return false; }
-        vals.__set(key, value);
-        exps.__set(key, exp_at);
-        return true;
+fun replay_aof(log: &Log, store: &Store) <bool> {
+    let chunk <[char]> = new [char, 16384]{};
+    let line <[char]> = new [char, MAX_FRAME + 1]{};
+    let used <int> = 0;
+    let offset <long> = cast<long>(0);
+    let valid <bool> = true;
+    while (valid) {
+        let got <long> = kv_read(log.fd, &chunk[0], cast<ulong>(16384));
+        if (got < cast<long>(0)) {
+            if (*kv_errno() == 4) { continue; }
+            valid = false; break;
+        }
+        if (got == cast<long>(0)) { break; }
+        for (let i <int> = 0; i < cast<int>(got) && valid; i++) {
+            let c <int> = cast<int>(chunk[i]) & 255;
+            offset++;
+            if (c == 10) {
+                let text <string> = from_chars(line, 0, used);
+                valid = replay_line(text, store);
+                free_str(text); used = 0;
+                if (valid) { log.end = offset; }
+            } else if (c < 32 || c == 127 || used == MAX_FRAME) { valid = false; }
+            else { line[used] = chunk[i]; used++; }
+        }
     }
-    if (starts_with(t, "DEL ")) {
-        let key <string> = substr(t, 4, len(t) - 4);
-        vals.remove(key);
-        exps.remove(key);
+    if (valid && used > 0) {
+        let tail <string> = from_chars(line, 0, used);
+        valid = torn_prefix(tail);
+        free_str(tail);
+        if (valid) {
+            valid = kv_truncate(log.fd, log.end) == 0;
+            if (valid) { valid = kv_fsync(log.fd) == 0; }
+            if (valid) { printf("repaired unterminated AOF tail at %lld\n", log.end); }
+        }
+    }
+    delete chunk; delete line;
+    return valid;
+}
+fun open_log(log: &Log, store: &Store) <bool> {
+    // Linux O_RDWR|O_CREAT|O_APPEND|O_NONBLOCK|O_NOFOLLOW|O_CLOEXEC; mode 0600.
+    log.fd = kv_open(AOF_PATH, 658498, 384);
+    if (log.fd < 0) { printf("error: cannot open AOF for read/write\n"); return false; }
+    if (kv_flock(log.fd, 6) != 0) { printf("error: AOF already locked\n"); return false; }
+    if (kv_seek(log.fd, cast<long>(0), 2) < cast<long>(0) || kv_seek(log.fd, cast<long>(0), 0) != cast<long>(0)) {
+        printf("error: AOF must be a seekable file\n"); return false;
+    }
+    // Do not mix descriptor reads/seeks with a live stdio stream. Replay and
+    // any tail repair finish first; only then wrap the append descriptor.
+    if (!replay_aof(log, store)) { printf("error: corrupt or unreadable AOF; refusing startup\n"); return false; }
+    if (kv_seek(log.fd, cast<long>(0), 2) != log.end) { return false; }
+    log.fp = kv_fdopen(log.fd, "a+b");
+    if (log.fp == null) { return false; }
+    // Unbuffered writes avoid retained stdio bytes escaping after rollback.
+    if (kv_setvbuf(log.fp, null, 2, cast<ulong>(0)) != 0) { return false; }
+    // Make creation of the fixed path durable before accepting any requests.
+    let dir <int> = kv_open(".", 589824, 0);
+    if (dir < 0) { return false; }
+    let synced <bool> = kv_fsync(log.fd) == 0 && kv_fsync(dir) == 0;
+    let closed <int> = kv_close(dir);
+    if (!synced || closed != 0) { return false; }
+    printf("replayed %s: %d live key(s) loaded\n", AOF_PATH, store.count);
+    return true;
+}
+fun close_log(log: &Log) <noret> {
+    if (log.fp != null) { kv_fclose(log.fp); }
+    else if (log.fd >= 0) { kv_close(log.fd); }
+}
+fun append_record(log: &Log, record: string) <bool> {
+    if (log.failed) { return false; }
+    let size <ulong> = cast<ulong>(len(record));
+    let wrote <ulong> = kv_fwrite(record, cast<ulong>(1), size, log.fp);
+    let flushed <int> = kv_fflush(log.fp);
+    let synced <int> = -1;
+    if (wrote == size && flushed == 0) { synced = kv_fsync(log.fd); }
+    if (wrote != size || flushed != 0 || synced != 0) {
+        // A failed durability operation poisons the writer until restart, even
+        // when rollback succeeds. No later command may hide this failure.
+        log.failed = true;
+        let truncated <int> = kv_truncate(log.fd, log.end);
+        let restored <int> = kv_fsync(log.fd);
+        if (truncated != 0 || restored != 0) { printf("error: AOF rollback durability uncertain\n"); }
+        else { printf("error: AOF write failed and was rolled back\n"); }
+        kv_fflush(null);
         return false;
     }
-    return false;
+    log.end += cast<long>(size);
+    return true;
 }
-
-fun replay_aof(vals: &HashMap<string, string>, exps: &HashMap<string, long>) <noret> {
-    if (!file_exists(AOF_PATH)) {
-        printf("no %s yet; starting with an empty dataset\n", AOF_PATH);
-        return;
-    }
-    // `read_to_string` is declared `fun?`: it may return null (unreadable file).
-    let content? <string> = read_to_string(AOF_PATH);
-    if (content == null) {
-        printf("warn: could not read %s; starting with an empty dataset\n", AOF_PATH);
-        return;
-    }
-    let text <string> = content?;
-    let loaded <int> = 0;
-    let rest <string> = text;
-    while (true) {
-        let nl <int> = index_of_char(rest, '\n');
-        if (nl < 0) { break; }
-        if (replay_line(substr(rest, 0, nl), vals, exps)) { loaded = loaded + 1; }
-        rest = substr(rest, nl + 1, len(rest) - nl - 1);
-    }
-    printf("replayed %s: %d live key(s) loaded\n", AOF_PATH, loaded);
+fun aof_log_set(log: &Log, p: &Parsed) <bool> {
+    let exp <string> = itoa(p.exp);
+    let a <string> = concat("SET ", p.key);
+    let b <string> = concat(a, " "); free_str(a);
+    a = concat(b, exp); free_str(b); free_str(exp);
+    b = concat(a, " "); free_str(a);
+    a = concat(b, p.value); free_str(b);
+    b = concat(a, "\n"); free_str(a);
+    let ok <bool> = append_record(log, b);
+    free_str(b); return ok;
 }
-
-// --- Command handling ------------------------------------------------------
-
-// Join tokens[from..to] with single spaces (rebuilds values, parses EX).
-fun join_tokens(parts: &Collection<string>, from_idx: int, to: int) <string> {
-    let out <string> = "";
-    let i <int> = from_idx;
-    while (i < to) {
-        if (i > from_idx) { out = concat(out, " "); }
-        out = concat(out, parts[i]);
-        i = i + 1;
-    }
-    return out;
+fun aof_log_del(log: &Log, line: string) <bool> {
+    let args <string> = substr(line, 4, len(line) - 4);
+    let body <string> = concat("DEL ", args);
+    let record <string> = concat(body, "\n");
+    let ok <bool> = append_record(log, record);
+    free_str(args); free_str(body); free_str(record);
+    return ok;
 }
-
-fun handle_line(line: string, vals: &HashMap<string, string>,
-                exps: &HashMap<string, long>) <Reply> {
-    // Blank line: reply with a bare newline so the one-line-in/one-line-out
-    // framing holds (an empty reply would leave a request/response client
-    // hanging forever).
-    if (len(line) == 0) { return Reply{text: "\n", close: false}; }
-    let parts <&Collection<string>> = split(line, ' ');
-    let argc <int> = parts.len();
-    let cmd <string> = to_upper(parts[0]);
-
-    if (equals(cmd, "PING")) {
-        if (argc == 2) { return Reply{text: concat(parts[1], "\n"), close: false}; }
-        if (argc != 1) { return err("wrong number of arguments for 'ping'"); }
-        return Reply{text: "PONG\n", close: false};
-    }
-    if (equals(cmd, "QUIT")) {
-        return Reply{text: "OK\n", close: true};
-    }
-    if (equals(cmd, "SET")) {
-        if (argc < 3) { return err("wrong number of arguments for 'set'"); }
-        let key <string> = parts[1];
-        // A trailing "EX <seconds>" turns into an expiry timestamp.
-        let val_end <int> = argc;
-        let exp_at <long> = cast<long>(0);
-        if (argc >= 5 && equals(to_upper(parts[argc - 2]), "EX") && is_numeric(parts[argc - 1])) {
-            exp_at = now() + cast<long>(parse_int(parts[argc - 1]));
-            val_end = argc - 2;
+fun keys_reply(store: &Store) <Reply> {
+    sweep(store);
+    let number <string> = itoa(cast<long>(store.count));
+    let prefix <string> = concat("(keys) ", number);
+    let header <string> = concat(prefix, "\n");
+    free_str(number); free_str(prefix);
+    let total <int> = len(header);
+    for (let i <int> = 0; i < SLOTS; i++) { if (store.states[i] == 1) { total += len(store.keys[i]) + 1; } }
+    let out <[char]> = new [char, total + 1]{};
+    let chars <[char]> = to_chars(header);
+    let at <int> = chars.length - 1;
+    for (let i <int> = 0; i < at; i++) { out[i] = chars[i]; }
+    delete chars; free_str(header);
+    for (let i <int> = 0; i < SLOTS; i++) {
+        if (store.states[i] == 1) {
+            let key <[char]> = to_chars(store.keys[i]);
+            for (let j <int> = 0; j < key.length - 1; j++) { out[at] = key[j]; at++; }
+            out[at] = '\n'; at++; delete key;
         }
-        let value <string> = join_tokens(parts, 2, val_end);
-        vals.__set(key, value);
-        exps.__set(key, exp_at);
-        aof_log_set(key, exp_at, value);
-        return Reply{text: "OK\n", close: false};
     }
-    if (equals(cmd, "GET")) {
-        if (argc != 2) { return err("wrong number of arguments for 'get'"); }
-        let key <string> = parts[1];
-        if (!vals.exists(key) || drop_expired(vals, exps, key)) {
-            return Reply{text: "(nil)\n", close: false};
-        }
-        return Reply{text: concat(vals.__get(key), "\n"), close: false};
+    let result <string> = from_chars(out, 0, at);
+    delete out;
+    return Reply{text: result, close: false};
+}
+fun execute(line: string, p: &Parsed, store: &Store, log: &Log) <Reply> {
+    if (len(p.error) > 0) { return error_reply(p.error); }
+    if (p.op == 1) { return reply(p.value); }
+    if (p.op == 8) { return Reply{text: concat("OK", "\n"), close: true}; }
+    if (p.op == 2) {
+        if (!can_put(store, p.key, p.value)) { return error_reply("store capacity exceeded"); }
+        if (!aof_log_set(log, p)) { return error_reply("persistence unavailable; write not applied"); }
+        put(store, p.key, p.value, p.exp);
+        return reply("OK");
     }
-    if (equals(cmd, "DEL")) {
-        if (argc < 2) { return err("wrong number of arguments for 'del'"); }
-        let n <int> = 0;
-        for (let i <int> = 1; i < argc; i++) {
-            drop_expired(vals, exps, parts[i]);
-            if (vals.exists(parts[i])) {
-                vals.remove(parts[i]);
-                exps.remove(parts[i]);
-                aof_log_del(parts[i]);
-                n = n + 1;
-            }
-        }
-        return Reply{text: concat("(integer) ", concat(itoa(cast<long>(n)), "\n")), close: false};
-    }
-    if (equals(cmd, "EXISTS")) {
-        if (argc != 2) { return err("wrong number of arguments for 'exists'"); }
-        let key <string> = parts[1];
-        if (!vals.exists(key) || drop_expired(vals, exps, key)) {
-            return Reply{text: "(integer) 0\n", close: false};
-        }
-        return Reply{text: "(integer) 1\n", close: false};
-    }
-    if (equals(cmd, "TTL")) {
-        if (argc != 2) { return err("wrong number of arguments for 'ttl'"); }
-        let key <string> = parts[1];
-        if (!vals.exists(key) || drop_expired(vals, exps, key)) {
-            return Reply{text: "(integer) -2\n", close: false};
-        }
-        let exp <long> = exps.get_or(key, cast<long>(0));
-        if (exp == cast<long>(0)) {
-            return Reply{text: "(integer) -1\n", close: false};
-        }
-        let left <long> = exp - now();
-        if (left < cast<long>(0)) { left = cast<long>(0); }
-        return Reply{text: concat("(integer) ", concat(itoa(left), "\n")), close: false};
-    }
-    if (equals(cmd, "KEYS")) {
-        if (argc != 2 || !equals(parts[1], "*")) {
-            return err("only KEYS * is supported");
-        }
+    if (p.op == 4) {
+        if (!aof_log_del(log, line)) { return error_reply("persistence unavailable; write not applied"); }
         let count <int> = 0;
-        let body <string> = "";
-        let slots <int> = vals.slot_count();
-        for (let s <int> = 0; s < slots; s++) {
-            if (vals.is_live(s)) {
-                let key <string> = vals.key_at(s);
-                if (!drop_expired(vals, exps, key)) {
-                    body = concat(body, concat(key, "\n"));
-                    count = count + 1;
-                }
-            }
+        for (let i <int> = 0; i < p.count; i++) {
+            let at <int> = lookup(store, p.keys[i]);
+            if (at >= 0) { erase_slot(store, at); count++; }
         }
-        let head <string> = concat("(keys) ", concat(itoa(cast<long>(count)), "\n"));
-        return Reply{text: concat(head, body), close: false};
+        return integer_reply(cast<long>(count));
     }
-    return err(concat("unknown command '", concat(parts[0], "'")));
+    if (p.op == 7) { return keys_reply(store); }
+    let at <int> = lookup(store, p.key);
+    if (p.op == 3) { return at < 0 : reply("(nil)") ? reply(store.values[at]); }
+    if (p.op == 5) { return integer_reply(at < 0 : cast<long>(0) ? cast<long>(1)); }
+    if (at < 0) { return integer_reply(cast<long>(-2)); }
+    if (store.expires[at] == cast<long>(0)) { return integer_reply(cast<long>(-1)); }
+    let left <long> = store.expires[at] - now();
+    if (left < cast<long>(0)) { left = cast<long>(0); }
+    return integer_reply(left);
+}
+fun handle_line(line: string, store: &Store, log: &Log) <Reply> {
+    if (len(line) == 0) { return reply(""); }
+    let p <Parsed> = parse_line(line, false);
+    let result <Reply> = execute(line, &p, store, log);
+    free_parsed(&p);
+    return result;
 }
 
-// Pull complete `\n`-terminated lines out of `data`, answer each, and hand
-// back the unterminated remainder plus whether the client is still alive.
-fun drain_lines(data: string, conn: &Socket, vals: &HashMap<string, string>,
-                exps: &HashMap<string, long>) <Drain> {
-    let rest <string> = data;
+fun monotonic_ms() <long> {
+    let ts <[long]> = new [long, 2]{};
+    let rc <int> = kv_clock(1, &ts[0]);
+    let result <long> = ts[0] * cast<long>(1000) + ts[1] / cast<long>(1000000);
+    delete ts;
+    return rc == 0 : result ? cast<long>(-1);
+}
+fun wait_socket(fd: int, events: int, deadline: long) <bool> {
+    let fds <[int]> = new [int, 2]{};
+    fds[0] = fd; fds[1] = events;
+    let ready <bool> = false;
     while (true) {
-        let nl <int> = index_of_char(rest, '\n');
-        if (nl < 0) { return Drain{rest: rest, alive: true}; }
-        let line <string> = trim(substr(rest, 0, nl));
-        rest = substr(rest, nl + 1, len(rest) - nl - 1);
-        let r <Reply> = handle_line(line, vals, exps);
-        if (len(r.text) > 0) {
-            if (!conn.send_text(r.text, len(r.text))) {
-                return Drain{rest: "", alive: false};
-            }
-        }
-        if (r.close) { return Drain{rest: "", alive: false}; }
+        let clock <long> = monotonic_ms();
+        let left <long> = deadline - clock;
+        if (clock < cast<long>(0) || left <= cast<long>(0)) { break; }
+        let result <int> = kv_poll(&fds[0], cast<ulong>(1), cast<int>(left));
+        if (result > 0) { ready = true; break; }
+        if (result == 0 || *kv_errno() != 4) { break; }
     }
-    // Unreachable: silences the frontend, which does not treat while(true) as diverging.
-    return Drain{rest: "", alive: false};
+    delete fds;
+    return ready;
 }
-
-// Serve one client until it quits, disconnects, or a send fails.
-fun serve_client(conn: &Socket, vals: &HashMap<string, string>,
-                 exps: &HashMap<string, long>) <noret> {
-    let buf <[char]> = new [char, RECV_CAP + 1]{};
-    let rem <string> = "";
+fun send_all(fd: int, text: string, timeout: int) <bool> {
+    let bytes <[char]> = to_chars(text);
+    let count <int> = bytes.length - 1;
+    let at <int> = 0;
+    let deadline <long> = monotonic_ms() + cast<long>(timeout);
+    while (at < count && wait_socket(fd, 4, deadline)) {
+        // MSG_DONTWAIT | MSG_NOSIGNAL: no blocking send or process-wide SIGPIPE.
+        let sent <long> = kv_send(fd, &bytes[at], cast<ulong>(count - at), 16448);
+        if (sent > cast<long>(0)) { at += cast<int>(sent); }
+        else if (sent == cast<long>(0) || (*kv_errno() != 4 && *kv_errno() != 11)) { break; }
+    }
+    delete bytes;
+    return at == count;
+}
+fun serve_client(fd: int, store: &Store, log: &Log, timeout: int) <noret> {
+    let chunk <[char]> = new [char, 4096]{};
+    let frame <[char]> = new [char, MAX_FRAME + 1]{};
+    let used <int> = 0;
     let alive <bool> = true;
-    while (alive) {
-        let n <int> = kv_recv(conn.fd, &buf[0], RECV_CAP, 0);
-        if (n <= 0) { break; }
-        buf[n] = cast<char>(0);
-        let piece <string> = from_chars(buf, 0, n);
-        let d <Drain> = drain_lines(concat(rem, piece), conn, vals, exps);
-        rem = d.rest;
-        alive = d.alive;
+    let deadline <long> = monotonic_ms() + cast<long>(timeout);
+    while (alive && wait_socket(fd, 1, deadline)) {
+        let got <long> = kv_recv(fd, &chunk[0], cast<ulong>(4096), 64);
+        if (got <= cast<long>(0)) {
+            if (got < cast<long>(0) && (*kv_errno() == 4 || *kv_errno() == 11)) { continue; }
+            break;
+        }
+        for (let i <int> = 0; i < cast<int>(got) && alive; i++) {
+            let c <int> = cast<int>(chunk[i]) & 255;
+            if (c == 10) {
+                if (used > 0 && frame[used - 1] == '\r') { used--; }
+                let line <string> = from_chars(frame, 0, used);
+                let result <Reply> = handle_line(line, store, log);
+                alive = send_all(fd, result.text, timeout) && !result.close;
+                free_str(result.text); free_str(line); used = 0;
+                deadline = monotonic_ms() + cast<long>(timeout);
+            } else if (c == 0 || (c < 32 && c != 13) || c == 127 || used == MAX_FRAME || (used > 0 && frame[used - 1] == '\r')) {
+                send_all(fd, "(error) invalid or oversized frame\n", timeout);
+                alive = false;
+            } else { frame[used] = chunk[i]; used++; }
+        }
     }
-    delete buf;
+    delete chunk; delete frame;
 }
-
+fun listen_loopback(port: int, actual: &int) <int> {
+    let fd <int> = kv_socket(2, 1, 0);
+    if (fd < 0) { return -1; }
+    let one <int> = 1;
+    if (kv_setsockopt(fd, 1, 2, &one, 4) != 0) { kv_close(fd); return -1; }
+    let addr <[int]> = new [int, 4]{};
+    addr[0] = cast<int>(2 + cast<long>(port / 256) * cast<long>(65536) + cast<long>(port % 256) * cast<long>(16777216));
+    let loopback <int> = kv_inet_addr("127.0.0.1");
+    addr[1] = loopback;
+    let ok <bool> = kv_bind(fd, &addr[0], 16) == 0 && kv_listen(fd, 16) == 0;
+    let size <int> = 16;
+    if (ok) { ok = kv_sockname(fd, &addr[0], &size) == 0; }
+    let word <uint> = cast<uint>(addr[0]);
+    *actual = cast<int>(((word / cast<uint>(65536)) % cast<uint>(256)) * cast<uint>(256) + word / cast<uint>(16777216));
+    delete addr;
+    if (!ok) { kv_close(fd); return -1; }
+    return fd;
+}
+fun env_number(name: string, fallback: long, maximum: long) <Number> {
+    let text <string> = kv_getenv(name);
+    if (text == null) { return Number{valid: true, value: fallback}; }
+    return decimal(text, maximum);
+}
 fun main() <int> {
-    let vals <HashMap<string, string>> = HashMap::<string, string>();
-    let exps <HashMap<string, long>> = HashMap::<string, long>();
-    replay_aof(&vals, &exps);
-    let srv <Socket> = Socket::serve(PORT, 16);
-    printf("fin-kv v0.1.0 listening on 127.0.0.1:%d (aof: %s)\n", PORT, AOF_PATH);
-    printf("talk to it with:  nc 127.0.0.1 %d\n", PORT);
+    let port <Number> = env_number("FIN_KV_PORT", cast<long>(7379), cast<long>(65535));
+    let timeout <Number> = env_number("FIN_KV_TIMEOUT_MS", cast<long>(5000), cast<long>(60000));
+    if (!port.valid || !timeout.valid || timeout.value == cast<long>(0)) { printf("error: invalid port or timeout\n"); return 1; }
+    let store <Store> = make_store();
+    let log <Log> = Log{fd: -1, fp: null, end: cast<long>(0), failed: false};
+    if (!open_log(&log, &store)) { close_log(&log); free_store(&store); return 1; }
+    let actual <int> = 0;
+    let listener <int> = listen_loopback(cast<int>(port.value), &actual);
+    if (listener < 0) { printf("error: cannot listen\n"); close_log(&log); free_store(&store); return 1; }
+    printf("fin-kv listening on 127.0.0.1:%d (aof: %s)\n", actual, AOF_PATH);
+    kv_fflush(null);
     while (true) {
-        let conn <Socket> = srv.accept_conn();
-        serve_client(&conn, &vals, &exps);
-        conn.shutdown();
+        let client <int> = kv_accept(listener, null, null);
+        if (client < 0) { if (*kv_errno() == 4) { continue; } break; }
+        serve_client(client, &store, &log, cast<int>(timeout.value));
+        kv_close(client);
     }
-    return 0;
+    kv_close(listener); close_log(&log); free_store(&store);
+    return 1;
 }
