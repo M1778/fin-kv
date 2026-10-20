@@ -1,0 +1,26 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120  # finc builds LLVM from source; the toolchain install is heavy
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Fin toolchain
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/M1778/Fin/master/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Frontend check
+        run: finc src/main.fin
+
+      - name: Build executable
+        run: finc src/main.fin -o fin-kv
+
+      - name: Smoke test
+        run: python3 tests/smoke.py
