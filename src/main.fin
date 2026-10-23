@@ -45,7 +45,7 @@ type KVSocketCount = long;
 #[llvm_name="WSAPoll"] @define kv_native_poll(fds: &void, count: uint, timeout: int) <int>;
 #c_else
 #[llvm_name="uname"] @define kv_uname(buf: &char) <int>;
-#[llvm_name="open"] @define kv_open(path: string, flags: int, mode: int) <int>;
+#[llvm_name="open"] @define kv_open(path: string, flags: int, ...) <int>;
 #[llvm_name="close"] @define kv_close(fd: int) <int>;
 #[llvm_name="fdopen"] @define kv_fdopen(fd: int, mode: string) <&void>;
 #[llvm_name="fsync"] @define kv_fsync(fd: int) <int>;
