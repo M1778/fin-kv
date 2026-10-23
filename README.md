@@ -10,13 +10,15 @@ in the compiled Fin binary.
 The implementation is verified on Linux x86-64 and ARM64 with Fin 0.4.0
 (contract 3), at both `-O0` and `-O2`, including the full durability/recovery suite
 in [native run 39508662175](https://github.com/M1778/fin-sdk/actions/runs/39508662175).
-Native Windows and macOS socket/file branches are now implemented and pass
-frontend/codegen branch checks. Linux x86_64 and native Windows x86_64 pass
-the O0/O2 functional, recovery, replay and deadline suites. Linux additionally
-passes partial-write/flush/fsync fault injection; that injection is explicitly
-skipped on Windows. Native macOS and fresh Linux ARM64 validation remain pending.
+Native O0/O2 functional, recovery, replay and deadline suites passed on all six
+hosts—Linux, macOS and Windows, each on x86_64 and ARM64—in
+[native matrix 40034937084](https://github.com/M1778/fin-sdk/actions/runs/40034937084).
+Linux additionally runs partial-write/flush/fsync fault injection; other hosts
+explicitly skip this Linux-specific mechanism. The compiler is externally
+verified candidate `5360b051b8e82a4f10052c3dbb77bc66cc727cd7` from CI run
+`40028977601`, not a released version.
 Windows uses Winsock, UCRT binary file I/O and native file locking;
-macOS uses its own errno, socket flags and stat layout.
+macOS uses its own errno, variadic file ABI, socket flags and stat layout.
 
 ```sh
 finc --fin-libs /path/to/lib/std src/main.fin
