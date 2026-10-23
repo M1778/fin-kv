@@ -10,8 +10,13 @@ in the compiled Fin binary.
 The implementation is verified on Linux x86-64 and ARM64 with Fin 0.4.0
 (contract 3), at both `-O0` and `-O2`, including the full durability/recovery suite
 in [native run 39508662175](https://github.com/M1778/fin-sdk/actions/runs/39508662175).
-It uses POSIX/Linux libc bindings; native Windows and macOS are not supported
-by this server's current socket/file bindings.
+Native Windows and macOS socket/file branches are now implemented and pass
+frontend/codegen branch checks. Linux x86_64 and native Windows x86_64 pass
+the O0/O2 functional, recovery, replay and deadline suites. Linux additionally
+passes partial-write/flush/fsync fault injection; that injection is explicitly
+skipped on Windows. Native macOS and fresh Linux ARM64 validation remain pending.
+Windows uses Winsock, UCRT binary file I/O and native file locking;
+macOS uses its own errno, socket flags and stat layout.
 
 ```sh
 finc --fin-libs /path/to/lib/std src/main.fin
@@ -27,8 +32,10 @@ python3 -I tests/smoke.py --bin /tmp/fin-kv
 ```
 
 The suite uses temporary working directories and ephemeral loopback ports.
-It requires Python 3, Linux `/proc`, and a C compiler (`CC`, default `cc`) to
-build a **test-only fault injector**. Tests cover normal commands, restart and
+It requires Python 3. On Linux, a C compiler (`CC`, default `cc`) builds a
+**test-only fault injector** using `/proc` and `LD_PRELOAD`. Other hosts run the
+functional/recovery suites and explicitly skip Linux-specific fault injection
+and unsupported memory sampling. Tests cover normal commands, restart and
 expiry, corrupt/torn logs, 100,000-record replay, bounded memory, table capacity,
 NUL/oversized input, overflow, idle/trickling clients, and failed writes.
 The injector routes writes to `/dev/full` and simulates partial-write, flush
@@ -48,8 +55,9 @@ nc 127.0.0.1 7379
   port reported in the listening banner.
 - `FIN_KV_TIMEOUT_MS`: decimal `1..60000`, default `5000`.
 - Listener binds **127.0.0.1 only**, not every interface.
-- `fin-kv.aof` lives in the working directory and is created with mode `0600`.
-  Existing file permissions are not changed. Symlinks are refused.
+- `fin-kv.aof` lives in the working directory. POSIX creates it with mode `0600`;
+  Windows inherits the data directory's ACL. Existing permissions are not changed.
+  Symlinks/reparse points and nonregular files are refused.
 - An exclusive advisory lock refuses a second cooperating writer to that AOF.
 
 There is no authentication or TLS. Loopback is not an authorization boundary
@@ -112,7 +120,9 @@ A failed write/flush/sync leaves the command unapplied in memory and returns an
 error. The writer attempts truncation to its last committed offset and fsyncs
 that rollback. It remains **write-disabled until restart**, even if rollback
 succeeds; reads continue. Initial AOF creation also fsyncs the parent directory
-before the listener starts.
+on Linux. macOS warns when its filesystem refuses directory fsync. Windows
+flushes file data with `_commit` but exposes no separate directory-fsync guarantee;
+new directory-entry durability is not promised there.
 
 Startup streams the log with fixed-size buffers rather than loading it whole.
 Every complete record is validated, including lengths and checked 64-bit epoch
