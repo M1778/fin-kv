@@ -4,12 +4,16 @@ import argparse
 import os
 from pathlib import Path
 import re
-import resource
-import select
+import platform
+import queue
 import socket
 import subprocess
 import tempfile
+import threading
 import time
+
+if os.name != "nt":
+    import resource
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -48,25 +52,38 @@ class Server:
         self.p = subprocess.Popen([str(binary)], cwd=directory, env=settings,
                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         self.output = b""
+        self.output_queue = queue.Queue()
+        self.reader = None
         if ready:
+            self.reader = threading.Thread(target=self.read_output, daemon=True)
+            self.reader.start()
             try:
                 self.wait_ready()
             except BaseException:
                 self.stop()
                 raise
 
+    def read_output(self):
+        while True:
+            data = self.p.stdout.readline()
+            self.output_queue.put(data)
+            if not data:
+                break
+
     def wait_ready(self):
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
-            if select.select([self.p.stdout], [], [], 0.1)[0]:
-                data = os.read(self.p.stdout.fileno(), 4096)
-                self.output += data
-                match = re.search(rb"listening on 127\.0\.0\.1:(\d+)", self.output)
-                if match:
-                    self.port = int(match[1])
-                    return
-            if self.p.poll() is not None:
-                raise AssertionError(f"server exited {self.p.returncode}: {self.output!r}")
+            try:
+                data = self.output_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            self.output += data
+            match = re.search(rb"listening on 127\.0\.0\.1:(\d+)", self.output)
+            if match:
+                self.port = int(match[1])
+                return
+            if not data:
+                raise AssertionError(f"server exited {self.p.poll()}: {self.output!r}")
         raise AssertionError(f"startup deadline: {self.output!r}")
 
     def client(self):
@@ -80,6 +97,8 @@ class Server:
         except subprocess.TimeoutExpired:
             self.p.kill()
             self.p.wait(timeout=5)
+        if self.reader is not None:
+            self.reader.join(timeout=5)
         self.p.stdout.close()
 
     def __enter__(self):
@@ -174,27 +193,40 @@ def recovery(binary, root):
         server.p.communicate(timeout=10)
         assert server.p.returncode != 0
     aof.rmdir()
-    os.mkfifo(aof)
-    with Server(binary, root, ready=False) as server:
-        server.p.communicate(timeout=5)
-        assert server.p.returncode != 0
-    assert aof.is_fifo()
-    aof.unlink()
-    aof.symlink_to("/dev/full")
-    with Server(binary, root, ready=False) as server:
-        server.p.communicate(timeout=5)
-        assert server.p.returncode != 0
-    assert aof.is_symlink()
-    aof.unlink()
-    aof.write_bytes(base)
-    aof.chmod(0)
+    if os.name != "nt":
+        os.mkfifo(aof)
+        with Server(binary, root, ready=False) as server:
+            server.p.communicate(timeout=5)
+            assert server.p.returncode != 0
+        assert aof.is_fifo()
+        aof.unlink()
+    else:
+        print("SKIP POSIX FIFO: Windows has no mkfifo")
+    target = root / "outside.aof"
+    target.write_bytes(base)
     try:
-        if os.geteuid() != 0:
-            with Server(binary, root, ready=False) as server:
-                server.p.communicate(timeout=10)
-                assert server.p.returncode != 0
-    finally:
-        aof.chmod(0o600)
+        aof.symlink_to(target)
+    except OSError as error:
+        if os.name != "nt":
+            raise
+        print(f"SKIP file symlink: Windows privilege unavailable ({error})")
+    else:
+        with Server(binary, root, ready=False) as server:
+            server.p.communicate(timeout=5)
+            assert server.p.returncode != 0
+        assert aof.is_symlink()
+        expect(target.read_bytes(), base)
+        aof.unlink()
+    aof.write_bytes(base)
+    if os.name != "nt":
+        aof.chmod(0)
+        try:
+            if os.geteuid() != 0:
+                with Server(binary, root, ready=False) as server:
+                    server.p.communicate(timeout=10)
+                    assert server.p.returncode != 0
+        finally:
+            aof.chmod(0o600)
     expect(aof.read_bytes(), base)
     with Server(binary, root) as first:
         with Server(binary, root, ready=False) as second:
@@ -390,8 +422,12 @@ def inputs(binary, root):
 
 
 def rss_kib(server):
-    status = Path(f"/proc/{server.p.pid}/status").read_text()
-    return int(re.search(r"VmRSS:\s+(\d+)", status)[1])
+    if platform.system() == "Linux":
+        status = Path(f"/proc/{server.p.pid}/status").read_text()
+        return int(re.search(r"VmRSS:\s+(\d+)", status)[1])
+    if platform.system() == "Darwin":
+        return int(subprocess.check_output(["ps", "-o", "rss=", "-p", str(server.p.pid)], text=True).strip())
+    return None
 
 
 def large_replay(binary, root):
@@ -405,8 +441,11 @@ def large_replay(binary, root):
     with Server(binary, root, timeout=5000) as server, server.client() as c:
         elapsed = time.monotonic() - start
         expect(c.cmd("GET key31"), "099999" + "x" * 112)
-        assert rss_kib(server) < 64000, rss_kib(server)
         before = rss_kib(server)
+        if before is not None:
+            assert before < 64000, before
+        else:
+            print("SKIP RSS sampling: unsupported platform; replay checks still run")
         # Exercise SET overwrite, DEL, tombstone reuse, replies and KEYS without
         # thousands of fsyncs: reads/KEYS expose per-request allocation leaks.
         for batch in range(20):
@@ -418,7 +457,8 @@ def large_replay(binary, root):
             expect(c.cmd("SET churn next"), "OK")
             expect(c.cmd("DEL churn"), "(integer) 1")
         after = rss_kib(server)
-        assert after - before < 8192, (before, after)
+        if before is not None and after is not None:
+            assert after - before < 8192, (before, after)
         c.s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
         for _ in range(20):
             expect(c.cmd("KEYS *"), "(keys) 128")
@@ -460,7 +500,7 @@ fun main() <int> {
 }
 '''
     test_source = work / "architecture.fin"
-    test_binary = work / "architecture"
+    test_binary = work / ("architecture.exe" if os.name == "nt" else "architecture")
     test_source.write_text(helper_test)
     command = [compiler, str(test_source), "-o", str(test_binary), "-" + opt]
     if libraries:
@@ -476,31 +516,36 @@ def main():
     parser.add_argument("--bin", type=Path, help="reuse binary, skip Fin compilation")
     parser.add_argument("--opt", choices=("O0", "O2"), default="O0")
     args = parser.parse_args()
-    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    if os.name != "nt":
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     with tempfile.TemporaryDirectory(prefix="finkv-test-") as temporary:
         work = Path(temporary)
-        binary = args.bin.resolve() if args.bin else work / "fin-kv"
+        binary = args.bin.resolve() if args.bin else work / ("fin-kv.exe" if os.name == "nt" else "fin-kv")
         if not args.bin:
             command = [args.compiler, str(ROOT / "src/main.fin"), "-o", str(binary), "-" + args.opt]
             if args.fin_libs:
                 command += ["--fin-libs", args.fin_libs]
             subprocess.run(command, check=True, timeout=120)
             architecture_mapping(args.compiler, args.fin_libs, args.opt, work)
-        shim_source = work / "faults.c"
-        shim = work / "faults.so"
-        shim_source.write_text(FAULT_SHIM)
-        subprocess.run([os.environ.get("CC", "cc"), "-shared", "-fPIC", "-O2",
-                        str(shim_source), "-o", str(shim), "-ldl"], check=True, timeout=30)
+        if platform.system() == "Linux":
+            shim_source = work / "faults.c"
+            shim = work / "faults.so"
+            shim_source.write_text(FAULT_SHIM)
+            subprocess.run([os.environ.get("CC", "cc"), "-shared", "-fPIC", "-O2",
+                            str(shim_source), "-o", str(shim), "-ldl"], check=True, timeout=30)
         for name, test in (("protocol/restart", protocol), ("recovery/corruption", recovery),
                            ("input/deadline", inputs), ("large replay/ownership", large_replay)):
             directory = work / name.split("/")[0]
             directory.mkdir()
             test(binary, directory)
             print(f"ok [{name}]", flush=True)
-        directory = work / "faults"
-        directory.mkdir()
-        persistence_faults(binary, directory, shim)
-        print("ok [/dev/full, partial write, flush, fsync; SET/DEL unchanged]", flush=True)
+        if platform.system() == "Linux":
+            directory = work / "faults"
+            directory.mkdir()
+            persistence_faults(binary, directory, shim)
+            print("ok [/dev/full, partial write, flush, fsync; SET/DEL unchanged]", flush=True)
+        else:
+            print("SKIP Linux LD_PRELOAD durability fault injection", flush=True)
     print("SMOKE OK", flush=True)
 
 

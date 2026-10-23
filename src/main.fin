@@ -5,58 +5,169 @@ import { len, equals, concat, substr, from_chars, to_chars, to_upper, clone, fre
 import { now } from time::std;
 import { hash_of } from hashmap::std;
 
-#[llvm_name="uname"]
-@define kv_uname(buf: &char) <int>;
-#[llvm_name="open"]
-@define kv_open(path: string, flags: int, mode: int) <int>;
-#[llvm_name="close"]
-@define kv_close(fd: int) <int>;
-#[llvm_name="fdopen"]
-@define kv_fdopen(fd: int, mode: string) <&void>;
-#[llvm_name="setvbuf"]
-@define kv_setvbuf(fp: &void, buf: &char, mode: int, size: ulong) <int>;
-#[llvm_name="fwrite"]
-@define kv_fwrite(buf: string, size: ulong, count: ulong, fp: &void) <ulong>;
-#[llvm_name="fflush"]
-@define kv_fflush(fp: &void) <int>;
-#[llvm_name="fclose"]
-@define kv_fclose(fp: &void) <int>;
-#[llvm_name="fsync"]
-@define kv_fsync(fd: int) <int>;
-#[llvm_name="ftruncate"]
-@define kv_truncate(fd: int, size: long) <int>;
-#[llvm_name="flock"]
-@define kv_flock(fd: int, operation: int) <int>;
-#[llvm_name="lseek"]
-@define kv_seek(fd: int, offset: long, whence: int) <long>;
-#[llvm_name="read"]
-@define kv_read(fd: int, buf: &char, count: ulong) <long>;
+#c_ifdef FIN_TARGET_WINDOWS
+pub type KVSocket = ulong;
+type KVSocketSize = int;
+type KVSocketCount = int;
+#c_else
+pub type KVSocket = int;
+type KVSocketSize = ulong;
+type KVSocketCount = long;
+#c_endif
+
+#[llvm_name="setvbuf"] @define kv_setvbuf(fp: &void, buf: &char, mode: int, size: ulong) <int>;
+#[llvm_name="fwrite"] @define kv_fwrite(buf: string, size: ulong, count: ulong, fp: &void) <ulong>;
+#[llvm_name="fflush"] @define kv_fflush(fp: &void) <int>;
+#[llvm_name="fclose"] @define kv_fclose(fp: &void) <int>;
+#[llvm_name="getenv"] @define kv_getenv(name: string) <string>;
+
+#c_ifdef FIN_TARGET_WINDOWS
+#[llvm_name="_close"] @define kv_close(fd: int) <int>;
+#[llvm_name="_fdopen"] @define kv_fdopen(fd: int, mode: string) <&void>;
+#[llvm_name="_commit"] @define kv_fsync(fd: int) <int>;
+#[llvm_name="_chsize_s"] @define kv_truncate(fd: int, size: long) <int>;
+#[llvm_name="_lseeki64"] @define kv_seek(fd: int, offset: long, whence: int) <long>;
+#[llvm_name="_read"] @define kv_native_read(fd: int, buf: &char, count: uint) <int>;
+#[llvm_name="_errno"] @define kv_errno() <&int>;
+#[llvm_name="CreateFileA"] @define kv_create_file(path: string, access: uint, share: uint, security: &void, disposition: uint, flags: uint, template: &void) <long>;
+#[llvm_name="GetFileInformationByHandle"] @define kv_file_info(handle: long, info: &char) <int>;
+#[llvm_name="GetFileType"] @define kv_file_type(handle: long) <uint>;
+#[llvm_name="CloseHandle"] @define kv_close_handle(handle: long) <int>;
+#[llvm_name="_open_osfhandle"] @define kv_open_handle(handle: long, flags: int) <int>;
+#[llvm_name="_get_osfhandle"] @define kv_get_handle(fd: int) <long>;
+#[llvm_name="LockFileEx"] @define kv_lock_file(handle: long, flags: uint, reserved: uint, low: uint, high: uint, overlapped: &void) <int>;
+#[llvm_name="GetTickCount64"] @define kv_ticks() <ulong>;
+#[llvm_name="WSAStartup"] @define kv_wsa_startup(version: ushort, data: &void) <int>;
+#[llvm_name="WSACleanup"] @define kv_wsa_cleanup() <int>;
+#[llvm_name="WSAGetLastError"] @define kv_socket_error() <int>;
+#[llvm_name="ioctlsocket"] @define kv_ioctl(fd: KVSocket, command: int, argument: &uint) <int>;
+#[llvm_name="closesocket"] @define kv_socket_close(fd: KVSocket) <int>;
+#[llvm_name="WSAPoll"] @define kv_native_poll(fds: &void, count: uint, timeout: int) <int>;
+#c_else
+#[llvm_name="uname"] @define kv_uname(buf: &char) <int>;
+#[llvm_name="open"] @define kv_open(path: string, flags: int, ...) <int>;
+#[llvm_name="close"] @define kv_close(fd: int) <int>;
+#[llvm_name="fdopen"] @define kv_fdopen(fd: int, mode: string) <&void>;
+#[llvm_name="fsync"] @define kv_fsync(fd: int) <int>;
+#[llvm_name="ftruncate"] @define kv_truncate(fd: int, size: long) <int>;
+#[llvm_name="flock"] @define kv_native_lock(fd: int, operation: int) <int>;
+#[llvm_name="lseek"] @define kv_seek(fd: int, offset: long, whence: int) <long>;
+#[llvm_name="read"] @define kv_native_read(fd: int, buf: &char, count: ulong) <long>;
+#c_ifdef FIN_TARGET_DARWIN
+#[llvm_name="__error"]
+#c_else
 #[llvm_name="__errno_location"]
+#c_endif
 @define kv_errno() <&int>;
-#[llvm_name="getenv"]
-@define kv_getenv(name: string) <string>;
-#[llvm_name="clock_gettime"]
-@define kv_clock(id: int, ts: &long) <int>;
-#[llvm_name="socket"]
-@define kv_socket(domain: int, kind: int, protocol: int) <int>;
-#[llvm_name="setsockopt"]
-@define kv_setsockopt(fd: int, level: int, option: int, value: &int, size: int) <int>;
-#[llvm_name="inet_addr"]
-@define kv_inet_addr(host: string) <int>;
-#[llvm_name="bind"]
-@define kv_bind(fd: int, addr: &int, size: int) <int>;
-#[llvm_name="listen"]
-@define kv_listen(fd: int, backlog: int) <int>;
-#[llvm_name="getsockname"]
-@define kv_sockname(fd: int, addr: &int, size: &int) <int>;
-#[llvm_name="accept"]
-@define kv_accept(fd: int, addr: &int, size: &int) <int>;
-#[llvm_name="poll"]
-@define kv_poll(fds: &int, count: ulong, timeout: int) <int>;
-#[llvm_name="recv"]
-@define kv_recv(fd: int, buf: &char, count: ulong, flags: int) <long>;
-#[llvm_name="send"]
-@define kv_send(fd: int, buf: &char, count: ulong, flags: int) <long>;
+#[llvm_name="clock_gettime"] @define kv_clock(id: int, ts: &long) <int>;
+#[llvm_name="fcntl"] @define kv_fcntl(fd: int, command: int, ...) <int>;
+#[llvm_name="close"] @define kv_socket_close(fd: KVSocket) <int>;
+#[llvm_name="poll"] @define kv_native_poll(fds: &void, count: ulong, timeout: int) <int>;
+#c_ifdef FIN_TARGET_DARWIN
+#c_ifdef FIN_TARGET_X86_64
+#[llvm_name="fstat$INODE64"]
+#c_else
+#[llvm_name="fstat"]
+#c_endif
+#c_else
+#[llvm_name="fstat"]
+#c_endif
+@define kv_native_fstat(fd: int, data: &char) <int>;
+#c_endif
+
+#[llvm_name="socket"] @define kv_socket(domain: int, kind: int, protocol: int) <KVSocket>;
+#[llvm_name="setsockopt"] @define kv_setsockopt(fd: KVSocket, level: int, option: int, value: &int, size: uint) <int>;
+#[llvm_name="inet_addr"] @define kv_inet_addr(host: string) <uint>;
+#[llvm_name="bind"] @define kv_bind(fd: KVSocket, addr: &int, size: uint) <int>;
+#[llvm_name="listen"] @define kv_listen(fd: KVSocket, backlog: int) <int>;
+#[llvm_name="getsockname"] @define kv_sockname(fd: KVSocket, addr: &int, size: &uint) <int>;
+#[llvm_name="accept"] @define kv_accept(fd: KVSocket, addr: &int, size: &uint) <KVSocket>;
+#[llvm_name="recv"] @define kv_recv(fd: KVSocket, buf: &char, count: KVSocketSize, flags: int) <KVSocketCount>;
+#[llvm_name="send"] @define kv_send(fd: KVSocket, buf: &char, count: KVSocketSize, flags: int) <KVSocketCount>;
+
+fun kv_socket_invalid() <KVSocket> { return cast<KVSocket>(-1); }
+fun kv_io_interrupted() <bool> {
+    #c_ifdef FIN_TARGET_WINDOWS
+    return kv_socket_error() == 10004;
+    #c_else
+    return *kv_errno() == 4;
+    #c_endif
+}
+fun kv_io_retry() <bool> {
+    #c_ifdef FIN_TARGET_WINDOWS
+    let code <int> = kv_socket_error();
+    return code == 10004 || code == 10035;
+    #c_else
+    let code <int> = *kv_errno();
+    #c_ifdef FIN_TARGET_DARWIN
+    return code == 4 || code == 35;
+    #c_else
+    return code == 4 || code == 11;
+    #c_endif
+    #c_endif
+}
+fun kv_network_init() <bool> {
+    #c_ifdef FIN_TARGET_WINDOWS
+    let data <[long]> = new [long, 51]{};
+    let status <int> = kv_wsa_startup(cast<ushort>(514), &data[0]);
+    let version <int> = cast<int>(cast<ulong>(data[0]) % cast<ulong>(65536));
+    delete data;
+    if (status != 0) { return false; }
+    if (version != 514) { kv_wsa_cleanup(); return false; }
+    #c_endif
+    return true;
+}
+fun kv_network_close() <noret> {
+    #c_ifdef FIN_TARGET_WINDOWS
+    kv_wsa_cleanup();
+    #c_endif
+}
+fun kv_prepare_client(fd: KVSocket) <bool> {
+    #c_ifdef FIN_TARGET_WINDOWS
+    let nonblocking <uint> = cast<uint>(1);
+    return kv_ioctl(fd, cast<int>(2147772030), &nonblocking) == 0;
+    #c_else
+    let flags <int> = kv_fcntl(fd, 3);
+    if (flags < 0) { return false; }
+    #c_ifdef FIN_TARGET_DARWIN
+    let one <int> = 1;
+    if (kv_setsockopt(fd, 65535, 4130, &one, cast<uint>(4)) != 0) { return false; }
+    return kv_fcntl(fd, 4, flags | 4) == 0;
+    #c_else
+    return kv_fcntl(fd, 4, flags | 2048) == 0;
+    #c_endif
+    #c_endif
+}
+fun kv_send_flags() <int> {
+    #c_ifdef FIN_TARGET_WINDOWS
+    return 0;
+    #c_else
+    #c_ifdef FIN_TARGET_DARWIN
+    return 0;
+    #c_else
+    return 16384;
+    #c_endif
+    #c_endif
+}
+fun kv_read(fd: int, buffer: &char, count: ulong) <long> {
+    #c_ifdef FIN_TARGET_WINDOWS
+    return cast<long>(kv_native_read(fd, buffer, cast<uint>(count)));
+    #c_else
+    return kv_native_read(fd, buffer, count);
+    #c_endif
+}
+fun kv_lock(fd: int) <bool> {
+    #c_ifdef FIN_TARGET_WINDOWS
+    let overlapped <[long]> = new [long, 4]{};
+    // Lock a byte beyond any supported log, preserving external read-only inspection.
+    overlapped[2] = cast<long>(9223372036854775807);
+    let locked <int> = kv_lock_file(kv_get_handle(fd), cast<uint>(3), cast<uint>(0), cast<uint>(1), cast<uint>(0), &overlapped[0]);
+    delete overlapped;
+    return locked != 0;
+    #c_else
+    return kv_native_lock(fd, 6) == 0;
+    #c_endif
+}
 
 const AOF_PATH <string> = "fin-kv.aof";
 const MAX_FRAME <int> = 8192;
@@ -89,32 +200,84 @@ fun linux_open_flags(machine: string) <OpenFlags> {
     return OpenFlags{valid: false, aof: 0, directory: 0};
 }
 fun detect_open_flags() <OpenFlags> {
+    #c_ifdef FIN_TARGET_WINDOWS
+    return OpenFlags{valid: true, aof: 32778, directory: 0};
+    #c_else
+    #c_ifdef FIN_TARGET_DARWIN
+    return OpenFlags{valid: true, aof: 16777998, directory: 17826048};
+    #c_else
     let invalid <OpenFlags> = OpenFlags{valid: false, aof: 0, directory: 0};
-    // Linux struct new_utsname is six 65-byte char fields (390 bytes):
-    // sysname at 0; machine at 4*65=260. Validate both terminators before use.
     let info <[char]> = new [char, 390]{};
-    if (kv_uname(&info[0]) != 0) {
-        printf("error: uname failed (errno=%d)\n", *kv_errno());
-        delete info; kv_fflush(null); return invalid;
-    }
+    if (kv_uname(&info[0]) != 0) { delete info; return invalid; }
     let system_end <int> = 0;
     while (system_end < 65 && info[system_end] != cast<char>(0)) { system_end++; }
     let machine_end <int> = 260;
     while (machine_end < 325 && info[machine_end] != cast<char>(0)) { machine_end++; }
-    if (system_end == 65 || machine_end == 325) {
-        printf("error: invalid uname field layout\n");
-        delete info; kv_fflush(null); return invalid;
-    }
+    if (system_end == 65 || machine_end == 325) { delete info; return invalid; }
     let system <string> = from_chars(info, 0, system_end);
     let machine <string> = from_chars(info, 260, machine_end - 260);
     let flags <OpenFlags> = linux_open_flags(machine);
-    if (!equals(system, "Linux") || !flags.valid) {
-        printf("error: unsupported platform %s/%s; require Linux x86_64 or aarch64\n", system, machine);
-        flags = invalid;
-        kv_fflush(null);
-    }
+    if (!equals(system, "Linux")) { flags = invalid; }
     free_str(system); free_str(machine); delete info;
     return flags;
+    #c_endif
+    #c_endif
+}
+fun kv_open_aof(flags: OpenFlags) <int> {
+    #c_ifdef FIN_TARGET_WINDOWS
+    // Sharing denies another writer or deletion while this handle is held.
+    let handle <long> = kv_create_file(AOF_PATH, cast<uint>(3221225472), cast<uint>(1), null, cast<uint>(4), cast<uint>(2097152), null);
+    if (handle == cast<long>(-1)) { return -1; }
+    let info <[char]> = new [char, 64]{};
+    let valid <bool> = kv_file_info(handle, &info[0]) != 0 && kv_file_type(handle) == cast<uint>(1);
+    let attributes <int> = (cast<int>(info[0]) & 255) + (cast<int>(info[1]) & 255) * 256;
+    delete info;
+    if (!valid || (attributes & 1040) != 0) { kv_close_handle(handle); return -1; }
+    let fd <int> = kv_open_handle(handle, flags.aof);
+    if (fd < 0) { kv_close_handle(handle); }
+    return fd;
+    #c_else
+    return kv_open(AOF_PATH, flags.aof, 384);
+    #c_endif
+}
+fun kv_regular_file(fd: int) <bool> {
+    #c_ifdef FIN_TARGET_WINDOWS
+    return true;
+    #c_else
+    let info <[char]> = new [char, 256]{};
+    let valid <bool> = kv_native_fstat(fd, &info[0]) == 0;
+    #c_ifdef FIN_TARGET_DARWIN
+    let at <int> = 4;
+    #c_else
+    #c_ifdef FIN_TARGET_ARM64
+    let at <int> = 16;
+    #c_else
+    let at <int> = 24;
+    #c_endif
+    #c_endif
+    let mode <int> = (cast<int>(info[at]) & 255) + (cast<int>(info[at + 1]) & 255) * 256;
+    delete info;
+    return valid && (mode & 61440) == 32768;
+    #c_endif
+}
+fun kv_parent_sync(flags: OpenFlags) <bool> {
+    #c_ifdef FIN_TARGET_WINDOWS
+    // Win32 does not expose directory fsync; only file data is flushed here.
+    return true;
+    #c_else
+    let dir <int> = kv_open(".", flags.directory, 0);
+    if (dir < 0) { return false; }
+    let synced <int> = kv_fsync(dir);
+    let error <int> = *kv_errno();
+    let closed <int> = kv_close(dir);
+    #c_ifdef FIN_TARGET_DARWIN
+    if (synced != 0 && (error == 22 || error == 9)) {
+        printf("warning: filesystem does not support directory fsync\n");
+        return closed == 0;
+    }
+    #c_endif
+    return synced == 0 && closed == 0;
+    #c_endif
 }
 
 fun decimal(s: string, maximum: long) <Number> {
@@ -426,9 +589,10 @@ fun open_log(log: &Log, store: &Store) <bool> {
     let flags <OpenFlags> = detect_open_flags();
     if (!flags.valid) { return false; }
     // Linux O_RDWR|O_CREAT|O_APPEND|O_NONBLOCK|O_NOFOLLOW|O_CLOEXEC; mode 0600.
-    log.fd = kv_open(AOF_PATH, flags.aof, 384);
+    log.fd = kv_open_aof(flags);
     if (log.fd < 0) { printf("error: cannot open AOF for read/write\n"); return false; }
-    if (kv_flock(log.fd, 6) != 0) { printf("error: AOF already locked\n"); return false; }
+    if (!kv_regular_file(log.fd)) { printf("error: AOF must be a regular file\n"); return false; }
+    if (!kv_lock(log.fd)) { printf("error: AOF already locked\n"); return false; }
     if (kv_seek(log.fd, cast<long>(0), 2) < cast<long>(0) || kv_seek(log.fd, cast<long>(0), 0) != cast<long>(0)) {
         printf("error: AOF must be a seekable file\n"); return false;
     }
@@ -439,24 +603,15 @@ fun open_log(log: &Log, store: &Store) <bool> {
     log.fp = kv_fdopen(log.fd, "a+b");
     if (log.fp == null) { return false; }
     // Unbuffered writes avoid retained stdio bytes escaping after rollback.
-    if (kv_setvbuf(log.fp, null, 2, cast<ulong>(0)) != 0) { return false; }
+    #c_ifdef FIN_TARGET_WINDOWS
+    let unbuffered <int> = 4;
+    #c_else
+    let unbuffered <int> = 2;
+    #c_endif
+    if (kv_setvbuf(log.fp, null, unbuffered, cast<ulong>(0)) != 0) { return false; }
     // Make creation of the fixed path durable before accepting any requests.
-    let dir <int> = kv_open(".", flags.directory, 0);
-    if (dir < 0) {
-        printf("error: cannot open AOF parent directory (flags=%d, errno=%d)\n", flags.directory, *kv_errno());
-        kv_fflush(null); return false;
-    }
-    if (kv_fsync(log.fd) != 0) {
-        printf("error: initial AOF fsync failed (errno=%d)\n", *kv_errno());
-        kv_close(dir); kv_fflush(null); return false;
-    }
-    if (kv_fsync(dir) != 0) {
-        printf("error: AOF parent directory fsync failed (errno=%d)\n", *kv_errno());
-        kv_close(dir); kv_fflush(null); return false;
-    }
-    if (kv_close(dir) != 0) {
-        printf("error: AOF parent directory close failed (errno=%d)\n", *kv_errno());
-        kv_fflush(null); return false;
+    if (kv_fsync(log.fd) != 0 || !kv_parent_sync(flags)) {
+        printf("error: initial AOF durability failed\n"); kv_fflush(null); return false;
     }
     printf("replayed %s: %d live key(s) loaded\n", AOF_PATH, store.count);
     return true;
@@ -567,51 +722,71 @@ fun handle_line(line: string, store: &Store, log: &Log) <Reply> {
 }
 
 fun monotonic_ms() <long> {
+    #c_ifdef FIN_TARGET_WINDOWS
+    return cast<long>(kv_ticks());
+    #c_else
     let ts <[long]> = new [long, 2]{};
+    #c_ifdef FIN_TARGET_DARWIN
+    let rc <int> = kv_clock(6, &ts[0]);
+    #c_else
     let rc <int> = kv_clock(1, &ts[0]);
+    #c_endif
     let result <long> = ts[0] * cast<long>(1000) + ts[1] / cast<long>(1000000);
     delete ts;
     return rc == 0 : result ? cast<long>(-1);
+    #c_endif
 }
-fun wait_socket(fd: int, events: int, deadline: long) <bool> {
+fun wait_socket(fd: KVSocket, events: int, deadline: long) <bool> {
+    #c_ifdef FIN_TARGET_WINDOWS
+    let fds <[long]> = new [long, 2]{};
+    fds[0] = cast<long>(fd);
+    let poll_event <long> = cast<long>(16);
+    if (events == 1) { poll_event = cast<long>(768); }
+    #c_else
     let fds <[int]> = new [int, 2]{};
-    fds[0] = fd; fds[1] = events;
+    fds[0] = fd;
+    let poll_event <int> = events;
+    #c_endif
     let ready <bool> = false;
     while (true) {
+        fds[1] = poll_event;
         let clock <long> = monotonic_ms();
         let left <long> = deadline - clock;
         if (clock < cast<long>(0) || left <= cast<long>(0)) { break; }
-        let result <int> = kv_poll(&fds[0], cast<ulong>(1), cast<int>(left));
+        #c_ifdef FIN_TARGET_WINDOWS
+        let result <int> = kv_native_poll(&fds[0], cast<uint>(1), cast<int>(left));
+        #c_else
+        let result <int> = kv_native_poll(&fds[0], cast<ulong>(1), cast<int>(left));
+        #c_endif
         if (result > 0) { ready = true; break; }
-        if (result == 0 || *kv_errno() != 4) { break; }
+        if (result == 0 || !kv_io_interrupted()) { break; }
     }
     delete fds;
     return ready;
 }
-fun send_all(fd: int, text: string, timeout: int) <bool> {
+fun send_all(fd: KVSocket, text: string, timeout: int) <bool> {
     let bytes <[char]> = to_chars(text);
     let count <int> = bytes.length - 1;
     let at <int> = 0;
     let deadline <long> = monotonic_ms() + cast<long>(timeout);
     while (at < count && wait_socket(fd, 4, deadline)) {
-        // MSG_DONTWAIT | MSG_NOSIGNAL: no blocking send or process-wide SIGPIPE.
-        let sent <long> = kv_send(fd, &bytes[at], cast<ulong>(count - at), 16448);
-        if (sent > cast<long>(0)) { at += cast<int>(sent); }
-        else if (sent == cast<long>(0) || (*kv_errno() != 4 && *kv_errno() != 11)) { break; }
+        let sent <KVSocketCount> = kv_send(fd, &bytes[at], cast<KVSocketSize>(count - at), kv_send_flags());
+        if (sent > cast<KVSocketCount>(0)) { at += cast<int>(sent); }
+        else if (sent == cast<KVSocketCount>(0) || !kv_io_retry()) { break; }
     }
     delete bytes;
     return at == count;
 }
-fun serve_client(fd: int, store: &Store, log: &Log, timeout: int) <noret> {
+fun serve_client(fd: KVSocket, store: &Store, log: &Log, timeout: int) <noret> {
     let chunk <[char]> = new [char, 4096]{};
     let frame <[char]> = new [char, MAX_FRAME + 1]{};
     let used <int> = 0;
     let alive <bool> = true;
     let deadline <long> = monotonic_ms() + cast<long>(timeout);
     while (alive && wait_socket(fd, 1, deadline)) {
-        let got <long> = kv_recv(fd, &chunk[0], cast<ulong>(4096), 64);
-        if (got <= cast<long>(0)) {
-            if (got < cast<long>(0) && (*kv_errno() == 4 || *kv_errno() == 11)) { continue; }
+        let got <KVSocketCount> = kv_recv(fd, &chunk[0], cast<KVSocketSize>(4096), 0);
+        if (got <= cast<KVSocketCount>(0)) {
+            if (got < cast<KVSocketCount>(0) && kv_io_retry()) { continue; }
             break;
         }
         for (let i <int> = 0; i < cast<int>(got) && alive; i++) {
@@ -631,22 +806,35 @@ fun serve_client(fd: int, store: &Store, log: &Log, timeout: int) <noret> {
     }
     delete chunk; delete frame;
 }
-fun listen_loopback(port: int, actual: &int) <int> {
-    let fd <int> = kv_socket(2, 1, 0);
-    if (fd < 0) { return -1; }
+fun listen_loopback(port: int, actual: &int) <KVSocket> {
+    let fd <KVSocket> = kv_socket(2, 1, 0);
+    if (fd == kv_socket_invalid()) { return kv_socket_invalid(); }
     let one <int> = 1;
-    if (kv_setsockopt(fd, 1, 2, &one, 4) != 0) { kv_close(fd); return -1; }
+    #c_ifdef FIN_TARGET_WINDOWS
+    let configured <bool> = kv_setsockopt(fd, 65535, -5, &one, cast<uint>(4)) == 0;
+    #c_else
+    #c_ifdef FIN_TARGET_DARWIN
+    let configured <bool> = kv_setsockopt(fd, 65535, 4, &one, cast<uint>(4)) == 0;
+    #c_else
+    let configured <bool> = kv_setsockopt(fd, 1, 2, &one, cast<uint>(4)) == 0;
+    #c_endif
+    #c_endif
+    if (!configured) { kv_socket_close(fd); return kv_socket_invalid(); }
     let addr <[int]> = new [int, 4]{};
-    addr[0] = cast<int>(2 + cast<long>(port / 256) * cast<long>(65536) + cast<long>(port % 256) * cast<long>(16777216));
-    let loopback <int> = kv_inet_addr("127.0.0.1");
-    addr[1] = loopback;
-    let ok <bool> = kv_bind(fd, &addr[0], 16) == 0 && kv_listen(fd, 16) == 0;
-    let size <int> = 16;
+    #c_ifdef FIN_TARGET_DARWIN
+    let family <int> = 528;
+    #c_else
+    let family <int> = 2;
+    #c_endif
+    addr[0] = cast<int>(cast<long>(family) + cast<long>(port / 256) * cast<long>(65536) + cast<long>(port % 256) * cast<long>(16777216));
+    addr[1] = cast<int>(kv_inet_addr("127.0.0.1"));
+    let ok <bool> = kv_bind(fd, &addr[0], cast<uint>(16)) == 0 && kv_listen(fd, 16) == 0;
+    let size <uint> = cast<uint>(16);
     if (ok) { ok = kv_sockname(fd, &addr[0], &size) == 0; }
     let word <uint> = cast<uint>(addr[0]);
     *actual = cast<int>(((word / cast<uint>(65536)) % cast<uint>(256)) * cast<uint>(256) + word / cast<uint>(16777216));
     delete addr;
-    if (!ok) { kv_close(fd); return -1; }
+    if (!ok) { kv_socket_close(fd); return kv_socket_invalid(); }
     return fd;
 }
 fun env_number(name: string, fallback: long, maximum: long) <Number> {
@@ -661,17 +849,18 @@ fun main() <int> {
     let store <Store> = make_store();
     let log <Log> = Log{fd: -1, fp: null, end: cast<long>(0), failed: false};
     if (!open_log(&log, &store)) { close_log(&log); free_store(&store); return 1; }
+    if (!kv_network_init()) { close_log(&log); free_store(&store); return 1; }
     let actual <int> = 0;
-    let listener <int> = listen_loopback(cast<int>(port.value), &actual);
-    if (listener < 0) { printf("error: cannot listen\n"); close_log(&log); free_store(&store); return 1; }
+    let listener <KVSocket> = listen_loopback(cast<int>(port.value), &actual);
+    if (listener == kv_socket_invalid()) { printf("error: cannot listen\n"); kv_network_close(); close_log(&log); free_store(&store); return 1; }
     printf("fin-kv listening on 127.0.0.1:%d (aof: %s)\n", actual, AOF_PATH);
     kv_fflush(null);
     while (true) {
-        let client <int> = kv_accept(listener, null, null);
-        if (client < 0) { if (*kv_errno() == 4) { continue; } break; }
-        serve_client(client, &store, &log, cast<int>(timeout.value));
-        kv_close(client);
+        let client <KVSocket> = kv_accept(listener, null, null);
+        if (client == kv_socket_invalid()) { if (kv_io_interrupted()) { continue; } break; }
+        if (kv_prepare_client(client)) { serve_client(client, &store, &log, cast<int>(timeout.value)); }
+        kv_socket_close(client);
     }
-    kv_close(listener); close_log(&log); free_store(&store);
+    kv_socket_close(listener); kv_network_close(); close_log(&log); free_store(&store);
     return 1;
 }
