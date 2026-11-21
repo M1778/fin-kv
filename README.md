@@ -203,11 +203,15 @@ that truncation is fsynced before requests are accepted.
 
 ## Platform support
 
-| Platform | Store | What CI runs |
+| Platform | Store | What CI actually runs |
 |---|---|---|
-| Linux x86-64, ARM64 | supported | builds and runs the full suite |
-| macOS (either arch) | **not supported** | builds, then must print the named refusal and exit 1 |
-| Windows (either arch) | **not supported** | builds, then must print the named refusal and exit 1 |
+| Linux x86-64 (O0 and O2), ARM64 | supported | builds, runs a self-check program, then the full suite: platform, boundary, durability |
+| macOS ARM64 | **not supported** | builds the real source, runs it, requires the named refusal and exit 1 |
+| Windows x86-64 | **not supported** | builds the real source, runs it, requires the named refusal and exit 1 |
+
+Verified on GitHub-hosted runners in every row above. `finc` comes from the
+pinned release in [`FINC_VERSION`](FINC_VERSION), with its SHA-256 checked
+against the release index before use.
 
 `src/main.fin` selects its whole body with `#c_ifdef FIN_TARGET_LINUX`. Off Linux,
 the file compiles to a program that prints
@@ -217,10 +221,21 @@ and exits `1`. This is deliberate: the store's extern declarations (`uname`,
 equivalent in this repository, and the compiler emits every declared function, so
 a partial build would fail to link rather than degrade.
 
-The macOS and Windows CI lanes are not silent skips. They build the real source,
+The macOS and Windows lanes are not silent skips. They build the real source,
 execute the binary, and require that exact message and a nonzero exit
 (`tests/platform.py --expect refusal`). A build that stopped compiling, or a
 refusal weakened into a zero exit, fails those lanes.
+
+### Build details worth knowing
+
+The published `finc 1.0.0` asks the C linker for `-lLLVM-22` on every executable
+build, even though the object it emits references no LLVM symbol. A machine
+without the LLVM development package therefore cannot link a program that does
+not use LLVM. CI passes `FIN_LDFLAGS=-lm`, which replaces that default library
+set, so the link matches what the code actually needs. On ARM64 Linux there is no
+free-standing release, so that lane installs the LLVM 22 runtime the dynamically
+linked compiler requires. Neither workaround is needed if you build with a
+`finc` that is fully self-contained.
 
 ## Tests
 

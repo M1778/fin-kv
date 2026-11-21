@@ -24,8 +24,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `FINC_VERSION`: the pinned compiler version CI installs.
 - `.github/scripts/install_finc.sh`: fetches the pinned `finc` release, verifies the
   published SHA-256, and refuses a triple with no artifact.
-- Three-platform CI (Linux, macOS, Windows) that installs a released compiler
-  instead of building one from source.
+- Three-platform CI (Linux x86-64 at O0 and O2, Linux ARM64, macOS, Windows) that
+  installs a released compiler instead of building one from source, and
+  compiles-and-runs a self-check program before trusting it.
 
 ### Changed
 
@@ -47,6 +48,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - `README.md` claimed Fin `0.4.0` and pointed macOS support at a non-existent
   configuration. Both now match what the repository builds and tests.
+- CI linked with `finc`'s default `-lLLVM-22`, which no clean runner has, so
+  every Linux lane failed at its first build. `FIN_LDFLAGS=-lm` now names the
+  libraries the generated code actually needs.
 
 ### Removed
 
