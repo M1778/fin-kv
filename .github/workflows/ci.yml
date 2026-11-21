@@ -59,6 +59,13 @@ jobs:
     name: linux-${{ matrix.arch }}-${{ matrix.opt }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+    env:
+      # Generated objects reference no LLVM symbol (`nm -u` lists only libc),
+      # but finc's default link line asks for -lLLVM-22 regardless, so an image
+      # without the LLVM development package cannot link a program that does
+      # not use LLVM. FIN_LDFLAGS replaces that default set. Job-level, because
+      # the self-check, the build and the suite's own compile all link.
+      FIN_LDFLAGS: "-lm"
     strategy:
       fail-fast: false
       matrix:
@@ -85,6 +92,21 @@ jobs:
             echo "PYTHON=python"
           fi
 
+      - name: Install the compiler's runtime (ARM64 only)
+        if: matrix.arch == 'aarch64'
+        # There is no musl artifact for aarch64, so this lane gets the
+        # dynamically linked gnu build, which needs libLLVM 22 present to start.
+        # x86-64 uses the free-standing musl build and needs nothing.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq curl gpg
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key |
+            gpg --dearmor | sudo tee /usr/share/keyrings/llvm-archive-keyring.gpg > /dev/null
+          echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] https://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" |
+            sudo tee /etc/apt/sources.list.d/llvm22.list > /dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq llvm-22-dev
+
       - name: Install finc
         run: $PYTHON .github/scripts/install_finc.py
 
@@ -102,14 +124,6 @@ jobs:
           "$RUNNER_TEMP/selfcheck" | grep -qx selfcheck
 
       - name: Build
-        # FIN_LDFLAGS replaces finc's default library set. Generated objects
-        # reference no LLVM symbol (checked with `nm -u`), but finc's default
-        # link line asks for -lLLVM-22 regardless, so an image without the LLVM
-        # development package cannot link a program that does not use LLVM.
-        # Dropping it keeps the link honest; the store needs only libm for
-        # printf's float helpers.
-        env:
-          FIN_LDFLAGS: "-lm"
         run: |
           mkdir -p out
           finc src/main.fin -${{ matrix.opt }} -o out/fin-kv
