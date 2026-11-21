@@ -74,6 +74,22 @@ def fetch(url: str) -> bytes:
         return resp.read()
 
 
+def expose(bin_dir: Path) -> None:
+    """Put the compiler on PATH for later CI steps.
+
+    `::add-path::` is a disabled workflow command -- GitHub Actions fails the
+    step rather than honouring it -- and its replacement is the GITHUB_PATH
+    file. Write that when Actions is running, and print a hint otherwise.
+    """
+    path_file = os.environ.get("GITHUB_PATH")
+    if path_file:
+        with open(path_file, "a", encoding="utf-8") as out:
+            out.write(str(bin_dir) + "\n")
+        print(f"added {bin_dir} to GITHUB_PATH")
+    else:
+        print(f"add {bin_dir} to PATH to use this compiler")
+
+
 def unpack(archive: Path, dest: Path) -> None:
     if archive.name.endswith(".zip"):
         with zipfile.ZipFile(archive) as zf:
@@ -111,7 +127,7 @@ def main() -> int:
         )
         if out.returncode == 0:
             print(f"finc already installed: {out.stdout.strip()}")
-            print(f"::add-path::{dest / 'bin'}")
+            expose(dest / "bin")
             return 0
         print("cached finc does not answer --version; reinstalling", file=sys.stderr)
 
@@ -217,8 +233,7 @@ def main() -> int:
         )
         return 1
 
-    # GitHub Actions picks this up; harmless elsewhere.
-    print(f"::add-path::{dest / 'bin'}")
+    expose(dest / "bin")
     return 0
 
 
