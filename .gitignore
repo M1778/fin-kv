@@ -2,7 +2,12 @@
 app
 app.exe
 *.o
+out/
+.finc/
+fin-kv.aof
 
-# finn (when the package manager lands)
-/target/
+# Python
+__pycache__/
+
+# finn
 finn.lock
