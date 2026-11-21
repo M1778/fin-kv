@@ -65,6 +65,11 @@ finn build          # writes out/fin-kv
 `finn.toml` names `main.fin` as the entrypoint, so `finn build` reads
 `src/main.fin` without further configuration.
 
+`finn test` only executes `tests/**/*.fin`, and this project's tests are Python
+drivers that exercise the compiled binary over sockets. `finn test` therefore
+reports "No .fin files under 'tests'" and exits 0 — it has not tested anything.
+Use `finn do test`, which runs `python3 tests/run.py`.
+
 Run it in the directory that should hold the log:
 
 ```sh
