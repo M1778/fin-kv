@@ -1,0 +1,7 @@
+ok [protocol/restart]
+ok [recovery/corruption]
+ok [input/deadline]
+  large replay: 0.08s, RSS 2436->2436 KiB
+ok [large replay/ownership]
+ok [/dev/full, partial write, flush, fsync; SET/DEL unchanged]
+SMOKE OK
