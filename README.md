@@ -56,6 +56,10 @@ The store is a binary, not a library. With `finc` on `PATH`:
 finc src/main.fin -o fin-kv
 ```
 
+If the link fails with `cannot find -lLLVM-22`, your `finc` is not
+self-contained: see [Build details](#build-details-worth-knowing). The short
+version is `FIN_LDFLAGS=-lm finc src/main.fin -o fin-kv`.
+
 With the package manager (`finn`):
 
 ```sh
