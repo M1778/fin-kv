@@ -1,15 +1,21 @@
-# finn.toml — REAL format per github.com/M1778/finn (README, 2026-10-19).
-# Layout: finn.toml, src/main.fin, tests/, .finn/packages/ (deps install here).
+# finn.toml — finn manifest (github.com/M1778/finn, format verified 2026-11-21).
+# Layout: finn.toml, src/<entrypoint>, tests/, .finn/packages/ for dependencies.
 [project]
 name = "fin-kv"
 version = "0.1.0"
 envpath = ".finn"
 entrypoint = "main.fin"
 
-# No registry is published yet (M1778/finn-registry has no registry_url),
-# and this app is stdlib-only, so [packages] stays empty.
+# stdlib-only, and no registry is published for a bare package name yet, so
+# [packages] stays empty.
 
 [scripts]
+# `finn do <name>` runs these with the shell (`sh -c`, `cmd /C` on Windows) from
+# the project root, so they stay plain commands: no `$VAR` expansion, which
+# `cmd` would not perform. Put the compiler you want on PATH, or set FINC and
+# call `python3 tests/run.py --compiler "$FINC"` yourself.
 check = "finc src/main.fin"
-build = "finc src/main.fin -o fin-kv"
-smoke = "python3 tests/smoke.py"
+build = "finc src/main.fin -o out/fin-kv"
+# `finn test` only runs tests/**/*.fin; this project's tests drive the compiled
+# binary over sockets, so they live in Python and are named here.
+test = "python3 tests/run.py"

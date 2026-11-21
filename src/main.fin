@@ -24,6 +24,7 @@
 // fin-kv: single-process, bounded, loopback TCP store (Linux/POSIX).
 // Strings in Store are owned; Parsed and Reply own their strings (error is borrowed).
 // AOF records are committed before map mutation. See README for failure semantics.
+#c_ifdef FIN_TARGET_LINUX
 import { len, equals, concat, substr, from_chars, to_chars, to_upper, clone, free_str, starts_with } from strings::std;
 import { now } from time::std;
 import { hash_of } from hashmap::std;
@@ -698,3 +699,11 @@ fun main() <int> {
     kv_close(listener); close_log(&log); free_store(&store);
     return 1;
 }
+#c_else
+// Refusal lives here so a non-Linux build links: every @define above is a
+// Linux symbol, and finc emits functions even when nothing calls them.
+fun main() <int> {
+    printf("error: fin-kv requires Linux x86_64 or aarch64; this binary is a platform refusal, not a server\n");
+    return 1;
+}
+#c_endif
