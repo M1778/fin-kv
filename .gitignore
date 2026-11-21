@@ -6,6 +6,9 @@ out/
 .finc/
 fin-kv.aof
 
+# stray build/test output
+*.log
+
 # Python
 __pycache__/
 
