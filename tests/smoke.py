@@ -22,98 +22,28 @@
 # SPDX-License-Identifier: MIT
 # =============================================================================
 
-"""Build/run the real Fin server; reusable against an independently built binary."""
+"""Durability and recovery suite for fin-kv (Linux).
+
+Builds or reuses the real Fin server and drives it over sockets. This file is
+about persistence and failure semantics: protocol boundaries live in
+tests/boundary.py. Linux-only by requirement rather than preference: it reads
+/proc for the RSS assertion, loads a test-only LD_PRELOAD fault injector, and
+uses FIFOs and advisory-lock behaviour of Linux `flock`.
+
+    python3 tests/smoke.py --bin /path/to/fin-kv
+    python3 tests/smoke.py --compiler /path/to/finc --opt O2
+"""
 import argparse
 import os
 from pathlib import Path
 import re
 import resource
-import select
 import socket
 import subprocess
 import tempfile
 import time
 
-ROOT = Path(__file__).resolve().parents[1]
-
-
-class Client:
-    def __init__(self, port):
-        self.s = socket.create_connection(("127.0.0.1", port), timeout=5)
-        self.f = self.s.makefile("rb")
-
-    def cmd(self, line):
-        self.s.sendall(line.encode() + b"\n")
-        return self.f.readline().decode().rstrip("\n")
-
-    def error(self, line):
-        answer = self.cmd(line)
-        assert answer.startswith("(error) "), (line, answer)
-
-    def close(self):
-        self.f.close()
-        self.s.close()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_):
-        self.close()
-
-
-class Server:
-    def __init__(self, binary, directory, *, timeout=700, env=None, ready=True):
-        self.directory = Path(directory)
-        self.aof = self.directory / "fin-kv.aof"
-        settings = os.environ.copy()
-        settings.update(FIN_KV_PORT="0", FIN_KV_TIMEOUT_MS=str(timeout))
-        settings.update(env or {})
-        self.p = subprocess.Popen([str(binary)], cwd=directory, env=settings,
-                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        self.output = b""
-        if ready:
-            try:
-                self.wait_ready()
-            except BaseException:
-                self.stop()
-                raise
-
-    def wait_ready(self):
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline:
-            if select.select([self.p.stdout], [], [], 0.1)[0]:
-                data = os.read(self.p.stdout.fileno(), 4096)
-                self.output += data
-                match = re.search(rb"listening on 127\.0\.0\.1:(\d+)", self.output)
-                if match:
-                    self.port = int(match[1])
-                    return
-            if self.p.poll() is not None:
-                raise AssertionError(f"server exited {self.p.returncode}: {self.output!r}")
-        raise AssertionError(f"startup deadline: {self.output!r}")
-
-    def client(self):
-        return Client(self.port)
-
-    def stop(self, kill=False):
-        if self.p.poll() is None:
-            self.p.kill() if kill else self.p.terminate()
-        try:
-            self.p.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self.p.kill()
-            self.p.wait(timeout=5)
-        self.p.stdout.close()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_):
-        self.stop()
-
-
-def expect(actual, wanted):
-    assert actual == wanted, (actual, wanted)
+from kv import ROOT, Server, expect
 
 
 def protocol(binary, root):
@@ -464,7 +394,12 @@ def architecture_mapping(compiler, libraries, opt, work):
     # Compile the actual production pure helper, not a Python copy of its table.
     # This checks both mappings on either host without forcing wrong syscall bits.
     source = (ROOT / "src/main.fin").read_text()
-    assert source.count("fun main() <int>") == 1
+    # The Linux branch is the subject; drop the platform-refusal branch so this
+    # harness sees exactly one `main` and one copy of the real helpers.
+    head, rest = source.split("#c_else", 1)
+    assert "#c_endif" in rest, "platform guard lost its #c_endif"
+    source = head
+    assert source.count("fun main() <int>") == 1, source.count("fun main() <int>")
     helper_test = source.replace("fun main() <int>", "fun server_main() <int>", 1)
     helper_test += r'''
 fun main() <int> {
