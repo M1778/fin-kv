@@ -125,7 +125,11 @@ def key_and_value_limits(binary, root):
         c.error("GET ")                       # empty key
         c.error("SET  value")                 # empty key on write
         c.error("SET k")                      # missing value
+        c.error("SET k ")                     # present but empty value
         c.error("SET  ")                      # nothing at all
+        # Empty value is refused, so the value bound really is 1..4096 and not 0..4096.
+        c.error("SET empty ")
+        expect(c.cmd("GET empty"), "(nil)")
         key_max = "k" * MAX_KEY
         value_max = "v" * MAX_VALUE
         expect(c.cmd("SET " + key_max + " " + value_max), "OK")
