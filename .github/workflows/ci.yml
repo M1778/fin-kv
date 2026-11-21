@@ -12,49 +12,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install build tools
+      - name: Install the C toolchain the smoke test needs
         run: |
+          # tests/smoke.py builds a small fault-injecting .so with $CC. That is the only
+          # thing this workflow needs from the host now that finc is an artifact.
           sudo apt-get update -qq
-          sudo apt-get install -y -qq cmake ninja-build bison flex python3 pipx clang gpg curl git
-          pipx install conan
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          sudo apt-get install -y -qq build-essential
 
-      - name: Install LLVM 22
+      - name: Install the pinned finc
+        run: python .github/scripts/install_finc.py --dest "$RUNNER_TEMP/finc"
+
+      - name: Put finc on PATH
         run: |
-          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor | sudo tee /usr/share/keyrings/llvm-archive-keyring.gpg > /dev/null
-          echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] https://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" | sudo tee /etc/apt/sources.list.d/llvm22.list > /dev/null
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq llvm-22-dev clang-22 libllvm22
-
-      - name: Restore finc toolchain cache
-        id: finc-restore
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            /tmp/Fin
-            ~/.conan2
-          key: finc-toolchain-v1
-
-      - name: Build finc (on cache miss)
-        if: steps.finc-restore.outputs.cache-hit != 'true'
-        run: |
-          export PATH="$HOME/.local/bin:/usr/lib/llvm-22/bin:$PATH"
-          git clone --depth 1 https://github.com/M1778/Fin.git /tmp/Fin
-          cd /tmp/Fin && ./build.sh --release --no-test
-
-      - name: Save finc toolchain cache
-        if: steps.finc-restore.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            /tmp/Fin
-            ~/.conan2
-          key: finc-toolchain-v1
-
-      - name: finc version
-        run: |
-          echo "/tmp/Fin/build" >> "$GITHUB_PATH"
-          /tmp/Fin/build/finc --version
+          echo "$RUNNER_TEMP/finc/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/finc/bin/finc" --version
 
       - name: Frontend check
         run: |
