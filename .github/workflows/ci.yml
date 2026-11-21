@@ -1,40 +1,147 @@
+# =============================================================================
+# Fin Programming Language
+#
+# Made with ❤️ for someone special.
+#
+# This project is genuinely built on love and dedication, a way to express your love can be done through Fin.
+# Fin is a semi-object-orientated programming language that specialized in control, giving so much control to the user while asking for the bare minimum.
+# Fin is the name of the Angel from BlackNightmare-Stories not yet published.
+# “Love is the reason this project exists”
+# -----------------------------------------------------------------------------
+# Author: M1778
+# Repository: https://github.com/M1778/fin-kv
+# Profile: https://github.com/M1778M/
+# -----------------------------------------------------------------------------
+# Copyright (C) 2027 M1778
+#
+# This file is part of fin-kv, a project for the Fin Programming Language.
+#
+# Licensed under the MIT License. See LICENSE in the repository root.
+#
+# SPDX-License-Identifier: MIT
+# =============================================================================
+
+# fin-kv CI.
+#
+# `finc` comes from the published release, not a source build: this repository
+# needs a compiler, not a compiler development environment. The version is
+# pinned in FINC_VERSION, and .github/scripts/install_finc.py verifies the
+# archive's SHA-256 against the release index before using it.
+#
+# The platform matrix is honest rather than uniform. fin-kv's store needs Linux
+# `uname`, `flock`, and per-architecture O_DIRECTORY/O_NOFOLLOW bits, so
+# `src/main.fin` compiles to a named refusal off Linux. Every lane therefore
+# builds and *executes* a real program; the macOS and Windows lanes require the
+# refusal, rather than reporting a pass for work they did not do.
+
 name: CI
 
 on:
   push:
     branches: [master, main]
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    # One script per step rather than one per operating system.
+    shell: bash
 
 jobs:
-  build:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 180
+  linux:
+    name: linux-${{ matrix.arch }}-${{ matrix.opt }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+            opt: O0
+          - runner: ubuntu-24.04
+            arch: x86_64
+            opt: O2
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+            opt: O0
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install the C toolchain the smoke test needs
+      - name: Locate Python
         run: |
-          # tests/smoke.py builds a small fault-injecting .so with $CC. That is the only
-          # thing this workflow needs from the host now that finc is an artifact.
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq build-essential
+          # Ubuntu 24.04 has no `python` alias and Windows has no `python3`;
+          # resolve once so every later step names one variable.
+          if command -v python3 > /dev/null; then
+            echo "PYTHON=python3" >> "$GITHUB_ENV"
+          else
+            echo "PYTHON=python" >> "$GITHUB_ENV"
+          fi
 
-      - name: Install the pinned finc
-        run: python .github/scripts/install_finc.py --dest "$RUNNER_TEMP/finc"
+      - name: Install finc
+        run: $PYTHON .github/scripts/install_finc.py
 
-      - name: Put finc on PATH
+      - name: Report compiler
         run: |
-          echo "$RUNNER_TEMP/finc/bin" >> "$GITHUB_PATH"
-          "$RUNNER_TEMP/finc/bin/finc" --version
+          finc --version
+          finc --version | grep -q 'contract 3'
 
-      - name: Frontend check
+      - name: Build
         run: |
-          finc src/main.fin
+          mkdir -p out
+          finc src/main.fin -${{ matrix.opt }} -o out/fin-kv
 
-      - name: Build executable
-        run: |
-          finc src/main.fin -o fin-kv
+      - name: Test
+        run: $PYTHON tests/run.py --bin out/fin-kv
 
-      - name: Smoke test
+  # The store cannot serve off Linux. These lanes build the same source and
+  # require a named message plus exit 1, so a build that stopped compiling, or
+  # a refusal quietly turned into a zero exit, fails here.
+  refusal:
+    name: ${{ matrix.name }} (store unsupported; named refusal)
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            runner: macos-15
+          - name: windows-x86_64
+            runner: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Locate Python
         run: |
-          python3 tests/smoke.py
+          if command -v python3 > /dev/null; then
+            echo "PYTHON=python3" >> "$GITHUB_ENV"
+          else
+            echo "PYTHON=python" >> "$GITHUB_ENV"
+          fi
+
+      - name: Install finc
+        run: $PYTHON .github/scripts/install_finc.py
+
+      - name: Report compiler
+        run: |
+          finc --version
+          finc --version | grep -q 'contract 3'
+
+      - name: Build the platform refusal
+        run: |
+          mkdir -p out
+          finc src/main.fin -o out/fin-kv
+
+      - name: Assert the refusal is named and nonzero
+        run: $PYTHON tests/platform.py --bin out/fin-kv --expect refusal
+
+      - name: Assert the full runner agrees with the host
+        run: $PYTHON tests/run.py --bin out/fin-kv
