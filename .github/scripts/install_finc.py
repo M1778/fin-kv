@@ -97,6 +97,30 @@ def fetch(url: str) -> bytes:
         return resp.read()
 
 
+# The published 1.0.0 artifacts are dynamically linked against LLVM 22, and
+# `finc` passes -lLLVM-22 (or an absolute Homebrew path on macOS) to every link
+# even though generated objects reference no LLVM symbol. A runner without that
+# library can run `--version` on Linux and then fail at the first `-o` build, so
+# this names the missing dependency instead of leaving a linker error.
+RUNTIME = {
+    "linux": "sudo apt-get install -y llvm-22-dev   # or use a release built for musl",
+    "darwin": "brew install llvm@22",
+}
+
+
+def runtime_hint(stderr: str) -> int:
+    lowered = stderr.lower()
+    if "libllvm" not in lowered:
+        return 1
+    key = "darwin" if sys.platform == "darwin" else "linux"
+    print(
+        "hint: this finc artifact needs the LLVM 22 runtime it was linked against:\n"
+        f"  {RUNTIME[key]}",
+        file=sys.stderr,
+    )
+    return 1
+
+
 def expose(bin_dir: Path) -> None:
     """Put the compiler on PATH for later CI steps.
 
@@ -244,7 +268,7 @@ def main() -> int:
             file=sys.stderr,
         )
         shutil.rmtree(dest, ignore_errors=True)
-        return 1
+        return runtime_hint(out.stderr)
 
     line = out.stdout.strip()
     print(f"installed: {line}")

@@ -82,18 +82,34 @@ jobs:
           if command -v python3 > /dev/null; then
             echo "PYTHON=python3" >> "$GITHUB_ENV"
           else
-            echo "PYTHON=python" >> "$GITHUB_ENV"
+            echo "PYTHON=python"
           fi
 
       - name: Install finc
         run: $PYTHON .github/scripts/install_finc.py
 
-      - name: Report compiler
+      - name: Prove the compiler builds and runs a program
+        # `finc --version` is not proof that linking works: a published artifact
+        # can answer it and still fail the first `-o` build, which is exactly
+        # what happened on the 1.0.0 gnu artifacts. Compiling a real program
+        # here turns that into one clear failure instead of a confusing one
+        # inside the suite.
         run: |
           finc --version
           finc --version | grep -q 'contract 3'
+          printf 'fun main() <int> { printf("selfcheck\\n"); return 0; }\n' > "$RUNNER_TEMP/selfcheck.fin"
+          finc "$RUNNER_TEMP/selfcheck.fin" -o "$RUNNER_TEMP/selfcheck"
+          "$RUNNER_TEMP/selfcheck" | grep -qx selfcheck
 
       - name: Build
+        # FIN_LDFLAGS replaces finc's default library set. Generated objects
+        # reference no LLVM symbol (checked with `nm -u`), but finc's default
+        # link line asks for -lLLVM-22 regardless, so an image without the LLVM
+        # development package cannot link a program that does not use LLVM.
+        # Dropping it keeps the link honest; the store needs only libm for
+        # printf's float helpers.
+        env:
+          FIN_LDFLAGS: "-lm"
         run: |
           mkdir -p out
           finc src/main.fin -${{ matrix.opt }} -o out/fin-kv
@@ -124,16 +140,26 @@ jobs:
           if command -v python3 > /dev/null; then
             echo "PYTHON=python3" >> "$GITHUB_ENV"
           else
-            echo "PYTHON=python" >> "$GITHUB_ENV"
+            echo "PYTHON=python"
           fi
+
+      - name: Install the compiler's macOS runtime
+        if: runner.os == 'macOS'
+        # The published macOS artifact links an absolute Homebrew LLVM path.
+        # That keg is the artifact's dependency, not this repository's, but a
+        # lane that cannot run its compiler tests nothing.
+        run: brew install llvm@22
 
       - name: Install finc
         run: $PYTHON .github/scripts/install_finc.py
 
-      - name: Report compiler
+      - name: Prove the compiler builds and runs a program
         run: |
           finc --version
           finc --version | grep -q 'contract 3'
+          printf 'fun main() <int> { printf("selfcheck\\n"); return 0; }\n' > "$RUNNER_TEMP/selfcheck.fin"
+          finc "$RUNNER_TEMP/selfcheck.fin" -o "$RUNNER_TEMP/selfcheck"
+          "$RUNNER_TEMP/selfcheck" | grep -qx selfcheck
 
       - name: Build the platform refusal
         run: |
