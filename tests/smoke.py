@@ -43,7 +43,7 @@ import subprocess
 import tempfile
 import time
 
-from kv import ROOT, Server, expect
+from kv import ROOT, Server, expect, resolve_binary
 
 
 def protocol(binary, root):
@@ -437,12 +437,15 @@ def main():
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     with tempfile.TemporaryDirectory(prefix="finkv-test-") as temporary:
         work = Path(temporary)
-        binary = args.bin.resolve() if args.bin else work / "fin-kv"
-        if not args.bin:
+        if args.bin:
+            binary = resolve_binary(args.bin)
+        else:
+            binary = work / "fin-kv"
             command = [args.compiler, str(ROOT / "src/main.fin"), "-o", str(binary), "-" + args.opt]
             if args.fin_libs:
                 command += ["--fin-libs", args.fin_libs]
-            subprocess.run(command, check=True, timeout=120)
+            subprocess.run(command, check=True, timeout=180)
+            binary = resolve_binary(binary)
             architecture_mapping(args.compiler, args.fin_libs, args.opt, work)
         shim_source = work / "faults.c"
         shim = work / "faults.so"

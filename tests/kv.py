@@ -40,6 +40,22 @@ ROOT = Path(__file__).resolve().parents[1]
 READY = re.compile(rb"listening on 127\.0\.0\.1:(\d+)")
 
 
+def resolve_binary(path):
+    """The executable the compiler actually wrote.
+
+    `finc -o out/fin-kv` appends `.exe` on Windows, so a caller that names the
+    output without the suffix still finds it. Every other platform is exact.
+    """
+    # Absolute, because the server runs with cwd set to its data directory.
+    candidate = Path(path).resolve()
+    if candidate.exists():
+        return candidate
+    with_exe = candidate.with_suffix(candidate.suffix + ".exe")
+    if with_exe.exists():
+        return with_exe
+    raise FileNotFoundError(f"no built binary at {candidate}")
+
+
 class Client:
     """One LF-terminated request/response connection."""
 

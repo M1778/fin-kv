@@ -40,7 +40,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from kv import ROOT
+from kv import ROOT, resolve_binary
 
 TESTS = Path(__file__).resolve().parent
 
@@ -72,9 +72,12 @@ def main():
         expected = "server" if sys.platform.startswith("linux") else "refusal"
 
     with tempfile.TemporaryDirectory(prefix="finkv-run-") as temporary:
-        binary = args.bin.resolve() if args.bin else Path(temporary) / "fin-kv"
-        if not args.bin:
+        if args.bin:
+            binary = resolve_binary(args.bin)
+        else:
+            binary = Path(temporary) / "fin-kv"
             build(args.compiler, args.opt, binary, args.fin_libs)
+            binary = resolve_binary(binary)
             print(f"built {binary} (-{args.opt})", flush=True)
         if expected == "server":
             run("platform.py", binary)

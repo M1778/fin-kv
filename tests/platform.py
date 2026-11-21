@@ -43,7 +43,7 @@ import argparse
 import tempfile
 from pathlib import Path
 
-from kv import Server, expect
+from kv import Server, expect, resolve_binary
 
 REFUSAL = "fin-kv requires Linux"
 
@@ -77,7 +77,7 @@ def main():
     parser.add_argument("--bin", type=Path, required=True)
     parser.add_argument("--expect", choices=("auto", "server", "refusal"), default="auto")
     args = parser.parse_args()
-    binary = args.bin.resolve()
+    binary = resolve_binary(args.bin)
     expected = args.expect
     if expected == "auto":
         expected = "server" if __import__("sys").platform.startswith("linux") else "refusal"

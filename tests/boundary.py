@@ -40,7 +40,7 @@ import tempfile
 from pathlib import Path
 
 import kv
-from kv import Server, expect, expect_close
+from kv import Server, expect, resolve_binary, expect_close
 
 MAX_FRAME = 8192
 MAX_KEY = 256
@@ -276,7 +276,7 @@ def main():
     parser.add_argument("--bin", type=Path, required=True,
                         help="an already built fin-kv binary")
     args = parser.parse_args()
-    binary = args.bin.resolve()
+    binary = resolve_binary(args.bin)
     with tempfile.TemporaryDirectory(prefix="finkv-boundary-") as temporary:
         root = Path(temporary)
         for index, (name, test) in enumerate(TESTS):
